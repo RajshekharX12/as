@@ -29,13 +29,11 @@ E = {
     "bad": "❌",
     "back": "⬅️",
     "spark": "⚡",
-    "tools": "🧰",
     "wallet": "👛",
     "profile": "👤",
     "logs": "📄",
     "health": "🩺",
     "gear": "⚙️",
-    "bell": "🔔",
     "recycle": "♻️",
     "credit": "💳",
     "doc": "🧾",
@@ -112,12 +110,16 @@ async def kv_get(k, d=None):
 async def kv_set(k, v):
     s = json.dumps(v)
     async with open_db() as db:
-        await db.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,s))
+        await db.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (k, s)
+        )
         await db.commit()
 
 async def log(level, msg):
     async with open_db() as db:
-        await db.execute("INSERT INTO events(ts,level,msg) VALUES(?,?,?)",(int(datetime.now().timestamp()), level, msg))
+        await db.execute("INSERT INTO events(ts,level,msg) VALUES(?,?,?)",
+                         (int(datetime.now().timestamp()), level, msg))
         await db.commit()
 
 async def ensure_user(user_id: int):
@@ -146,7 +148,8 @@ async def auto_on(user_id:int)->bool:
 
 async def set_auto(user_id:int, flag:bool):
     async with open_db() as db:
-        await db.execute("UPDATE users SET auto_on=? WHERE user_id=?", (1 if flag else 0, user_id)); await db.commit()
+        await db.execute("UPDATE users SET auto_on=? WHERE user_id=?", (1 if flag else 0, user_id))
+        await db.commit()
 
 async def settings_of(user_id:int)->Dict[str,int|str]:
     async with open_db() as db:
@@ -156,7 +159,8 @@ async def settings_of(user_id:int)->Dict[str,int|str]:
 
 async def set_setting(user_id:int, key:str, val:int|str):
     async with open_db() as db:
-        await db.execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (val, user_id)); await db.commit()
+        await db.execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (val, user_id))
+        await db.commit()
 
 async def allow_toggle(user_id:int, gift_id:str)->bool:
     try:
@@ -226,8 +230,8 @@ def in_window(now:datetime, win:str)->bool:
     return (t1<=nt<=t2) if t1<=t2 else (nt>=t1 or nt<=t2)
 
 def normalize_gift(g:Dict[str,Any])->Dict[str,Any]:
-    gid = str(g.get("id") or g.get("gift_id") or g.get("gid") or "")
-    title = str(g.get("title") or g.get("name") or g.get("base_name") or "Gift")
+    gid = str(g.get("id") or g.get("gift_id") or "")
+    title = str(g.get("title") or g.get("name") or "Gift")
     price = int(g.get("star_count") or (g.get("price") or {}).get("star_count") or g.get("price") or 0)
     emoji = g.get("emoji") or (g.get("sticker") or {}).get("emoji") or "🎁"
     rem = g.get("remaining_count")
@@ -246,14 +250,20 @@ router = Router()
 
 def main_menu(auto_on_flag: bool)->InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"{E['spark']} Auto-Buy: {'ON '+E['ok'] if auto_on_flag else 'OFF '+E['bad']}", callback_data="auto:toggle"),
-         InlineKeyboardButton(f"🔎 Source", callback_data="source:menu")],
-        [InlineKeyboardButton(f"{E['gear']} Auto-Purchase Settings", callback_data="settings:menu")],
-        [InlineKeyboardButton(f"{E['gift']} Gift Catalog", callback_data="cata:0")],
-        [InlineKeyboardButton(f"{E['profile']} Profile", callback_data="profile:open"),
-         InlineKeyboardButton(f"⭐ Deposit", callback_data="topup:menu")],
-        [InlineKeyboardButton(f"{E['health']} Health", callback_data="health:run"),
-         InlineKeyboardButton(f"{E['logs']} Logs", callback_data="logs:open")],
+        [
+            InlineKeyboardButton(text=f"{E['spark']} Auto-Buy: {'ON '+E['ok'] if auto_on_flag else 'OFF '+E['bad']}", callback_data="auto:toggle"),
+            InlineKeyboardButton(text="🔎 Source", callback_data="source:menu"),
+        ],
+        [InlineKeyboardButton(text=f"{E['gear']} Auto-Purchase Settings", callback_data="settings:menu")],
+        [InlineKeyboardButton(text=f"{E['gift']} Gift Catalog", callback_data="cata:0")],
+        [
+            InlineKeyboardButton(text=f"{E['profile']} Profile", callback_data="profile:open"),
+            InlineKeyboardButton(text="⭐ Deposit", callback_data="topup:menu"),
+        ],
+        [
+            InlineKeyboardButton(text=f"{E['health']} Health", callback_data="health:run"),
+            InlineKeyboardButton(text=f"{E['logs']} Logs", callback_data="logs:open"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -291,8 +301,8 @@ async def cb_profile(c: CallbackQuery):
         f"{E['spark']} Auto: {'on' if auto else 'off'}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Refunds / Credits", callback_data="refund:menu")],
-        [InlineKeyboardButton("Back", callback_data="home")]
+        [InlineKeyboardButton(text="Refunds / Credits", callback_data="refund:menu")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
@@ -300,13 +310,12 @@ async def cb_profile(c: CallbackQuery):
 @router.callback_query(F.data == "source:menu")
 async def cb_source_menu(c: CallbackQuery):
     path = (await kv_get("notifier_path")) or "(none)"
-    # quick test
     count = len(await kv_get("last_notifier_items") or [])
     txt = f"Source: NOTIFIER\nJSON path: {path}\nLast parsed: {count} gifts"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Set JSON path", callback_data="source:path")],
-        [InlineKeyboardButton("Test Notifier", callback_data="source:test")],
-        [InlineKeyboardButton("Back", callback_data="home")]
+        [InlineKeyboardButton(text="Set JSON path", callback_data="source:path")],
+        [InlineKeyboardButton(text="Test Notifier", callback_data="source:test")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
@@ -344,14 +353,14 @@ async def cb_settings(c: CallbackQuery):
         f"Window: {s['window'] or '(always)'}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Cycles", callback_data="set:cycles")],
-        [InlineKeyboardButton("Lower limit", callback_data="set:min"),
-         InlineKeyboardButton("Upper limit", callback_data="set:max")],
-        [InlineKeyboardButton("Overall limit", callback_data="set:overall"),
-         InlineKeyboardButton("Supply limit", callback_data="set:supply")],
-        [InlineKeyboardButton("Allow IDs", callback_data="lim:set:ids"),
-         InlineKeyboardButton("Window", callback_data="lim:set:window")],
-        [InlineKeyboardButton("Back", callback_data="home")]
+        [InlineKeyboardButton(text="Cycles", callback_data="set:cycles")],
+        [InlineKeyboardButton(text="Lower limit", callback_data="set:min"),
+         InlineKeyboardButton(text="Upper limit", callback_data="set:max")],
+        [InlineKeyboardButton(text="Overall limit", callback_data="set:overall"),
+         InlineKeyboardButton(text="Supply limit", callback_data="set:supply")],
+        [InlineKeyboardButton(text="Allow IDs", callback_data="lim:set:ids"),
+         InlineKeyboardButton(text="Window", callback_data="lim:set:window")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
@@ -373,7 +382,7 @@ async def cb_setting_prompts(c: CallbackQuery):
 @router.callback_query(F.data.startswith("cata:"))
 async def cb_cata(c: CallbackQuery):
     p = c.data.split(":")
-    if len(p)==2:   # cata:0
+    if len(p)==2:   # "cata:0"
         page = int(p[1])
         gifts = await fetch_gifts_from_api()
         gifts.sort(key=lambda x: (x["star_count"], x["gift_id"]))
@@ -387,14 +396,14 @@ async def cb_cata(c: CallbackQuery):
             gid, title, price, emoji = g["gift_id"], g["title"], g["star_count"], g["emoji"]
             lines.append(f"• {emoji} {title} — {price}{E['star']} (id {gid})")
             kb_rows.append([
-                InlineKeyboardButton(f"Buy {price}{E['star']}", callback_data=f"cata:buy:{gid}:{price}:{title[:40]}"),
-                InlineKeyboardButton("+Allow", callback_data=f"cata:allow:{gid}"),
+                InlineKeyboardButton(text=f"Buy {price}{E['star']}", callback_data=f"cata:buy:{gid}:{price}:{title[:40]}"),
+                InlineKeyboardButton(text="+Allow", callback_data=f"cata:allow:{gid}"),
             ])
         nav=[]
-        if page>0: nav.append(InlineKeyboardButton(f"{E['back']} Prev", callback_data=f"cata:{page-1}"))
-        if page+1<total: nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"cata:{page+1}"))
+        if page>0: nav.append(InlineKeyboardButton(text=f"{E['back']} Prev", callback_data=f"cata:{page-1}"))
+        if page+1<total: nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"cata:{page+1}"))
         if nav: kb_rows.append(nav)
-        kb_rows.append([InlineKeyboardButton("Back", callback_data="home")])
+        kb_rows.append([InlineKeyboardButton(text="Back", callback_data="home")])
         await c.message.edit_text("\n".join(lines) if view else "No gifts now.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)); await c.answer()
         return
 
@@ -407,7 +416,6 @@ async def cb_cata(c: CallbackQuery):
     if p[1]=="buy":
         gid, price, title = p[2], int(p[3]), p[4]
         uid = c.from_user.id
-        # check internal credit
         credit = await credit_of(uid)
         if credit < price:
             await c.answer(f"Not enough internal credit ({credit}{E['star']}). Top up first.", show_alert=True); return
@@ -427,10 +435,10 @@ async def cb_cata(c: CallbackQuery):
 @router.callback_query(F.data == "refund:menu")
 async def cb_refunds(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("↩️ Refund last purchase (credit)", callback_data="refund:last")],
-        [InlineKeyboardButton("🧾 Refund by TxID (credit)", callback_data="refund:txid")],
-        [InlineKeyboardButton("➕ Add manual credit", callback_data="refund:add")],
-        [InlineKeyboardButton("Back", callback_data="home")]
+        [InlineKeyboardButton(text="↩️ Refund last purchase (credit)", callback_data="refund:last")],
+        [InlineKeyboardButton(text="🧾 Refund by TxID (credit)", callback_data="refund:txid")],
+        [InlineKeyboardButton(text="➕ Add manual credit", callback_data="refund:add")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text("Refunds / Credits — internal only (Telegram Stars are final).", reply_markup=kb); await c.answer()
 
@@ -455,23 +463,24 @@ async def cb_refund_add(c: CallbackQuery):
 @router.callback_query(F.data == "refund:txid")
 async def cb_refund_txid(c: CallbackQuery):
     await kv_set("pending", {"user": c.from_user.id, "key": "refund:txid"})
-    await c.message.edit_text("Send the **Star Transaction ID** now.", reply_markup=back_home()); await c.answer()
+    await c.message.edit_text("Send the Star Transaction ID now.", reply_markup=back_home()); await c.answer()
 
 # ── TOP UP (STARS / XTR) ─────────────────────────────────────────────────────
 @router.callback_query(F.data == "topup:menu")
 async def cb_topup(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Add 50⭐", callback_data="top:go:50"),
-         InlineKeyboardButton("Add 1000⭐", callback_data="top:go:1000"),
-         InlineKeyboardButton("Add 3000⭐", callback_data="top:go:3000")],
-        [InlineKeyboardButton("Back", callback_data="home")]
+        [InlineKeyboardButton(text="Add 50⭐", callback_data="top:go:50"),
+         InlineKeyboardButton(text="Add 1000⭐", callback_data="top:go:1000"),
+         InlineKeyboardButton(text="Add 3000⭐", callback_data="top:go:3000")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text("Top up Stars", reply_markup=kb); await c.answer()
 
 @router.callback_query(F.data.startswith("top:go:"))
 async def cb_topup_go(c: CallbackQuery, bot: Bot):
     amt = int(c.data.split(":")[-1])
-    await bot.send_invoice(chat_id=c.message.chat.id, title="Top up Stars", description=f"Add {amt}⭐ to bot balance",
+    await bot.send_invoice(chat_id=c.message.chat.id, title="Top up Stars",
+                           description=f"Add {amt}⭐ to bot balance",
                            payload=f"topup:{amt}", currency="XTR",
                            prices=[LabeledPrice(label=f"{amt}⭐", amount=amt)])
     await c.answer("Invoice sent")
@@ -529,7 +538,6 @@ async def on_text(m: Message):
             await set_setting(uid, "supply_limit", max(0,int(txt))); await m.answer("Supply limit updated (0=∞).")
         elif key=="lim:set:ids":
             ids = [x.strip() for x in txt.split(",") if x.strip()]
-            # wipe + add
             async with open_db() as db:
                 await db.execute("DELETE FROM allowlist WHERE user_id=?", (uid,))
                 for gid in ids:
@@ -572,7 +580,7 @@ RUN = {"spent":0, "bought":0, "cycles":None}
 async def autobuy_loop(bot: Bot):
     while True:
         try:
-            # find users with auto_on = 1
+            # users with auto_on
             async with open_db() as db:
                 async with db.execute("SELECT user_id FROM users WHERE auto_on=1") as cur:
                     active = [r["user_id"] for r in await cur.fetchall()]
@@ -582,11 +590,10 @@ async def autobuy_loop(bot: Bot):
             gifts = await fetch_gifts_from_api()
             for uid in active:
                 s = await settings_of(uid)
-                winok = in_window(datetime.now(), s.get("window",""))
-                if not winok: continue
+                if not in_window(datetime.now(), s.get("window","")): 
+                    continue
                 credit = await credit_of(uid)
 
-                # stop by overall/supply/cycles if needed
                 if RUN["cycles"] is None:
                     RUN["cycles"] = s.get("cycles") or 0
                 if RUN["cycles"]>0:
@@ -595,7 +602,7 @@ async def autobuy_loop(bot: Bot):
                 for g in gifts:
                     price = int(g["star_count"])
                     if s["min_price"] and price < s["min_price"]: continue
-                    if s["max_price"] and price > s["max_price"]: continue
+                    if s["max_price"] and s["max_price"]>0 and price > s["max_price"]: continue
                     if credit < price: continue
                     if not await allowed(uid, g["gift_id"]): continue
                     try:
