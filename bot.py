@@ -42,12 +42,11 @@ CREATE TABLE IF NOT EXISTS events(
   level TEXT NOT NULL,
   msg TEXT NOT NULL
 );
--- ledger: internal credits/debits we control (refund-like credits, topups, spends)
 CREATE TABLE IF NOT EXISTS ledger(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
-  amount INTEGER NOT NULL,   -- +credit, -debit
+  amount INTEGER NOT NULL,
   note TEXT
 );
 """
@@ -95,7 +94,7 @@ async def ledger_balance(user_id:int)->int:
             (s,) = await cur.fetchone()
             return int(s or 0)
 
-# -------------- Bot API (thin) --------------
+# -------------- Bot API --------------
 class TG:
     def __init__(self, token: str):
         self.base = f"https://api.telegram.org/bot{token}"
@@ -135,7 +134,7 @@ def is_admin(uid: int, owner: Optional[int]) -> bool:
 
 # -------------- state --------------
 AUTOBUY_TASK: Optional[asyncio.Task] = None
-RUN = {"cycles_left": None, "spent": 0, "bought": 0}  # per-run counts
+RUN = {"cycles_left": None, "spent": 0, "bought": 0}
 
 def interval_for(speed:str)->float:
     s = (speed or "FAST").upper()
@@ -155,17 +154,23 @@ def within_window(now: datetime, window: str) -> bool:
     return (t1<=nt<=t2) if (t1<=t2) else (nt>=t1 or nt<=t2)
 
 def normalize_gift_dict(x: Dict[str,Any]) -> Dict[str,Any]:
-    gid = str(x.get("id") or x.get("gift_id") or "")
+    # accept many possible shapes from API or notifier
+    gid = str(x.get("id") or x.get("gift_id") or x.get("gid") or "")
     title = str(x.get("title") or x.get("name") or x.get("base_name") or "Gift")
     price = int(x.get("star_count") or (x.get("price") or {}).get("star_count") or x.get("price") or 0)
-    return {"gift_id": gid, "title": title, "star_count": price}
+    emoji = (x.get("emoji") or x.get("icon") or x.get("emote") or x.get("sticker_emoji") or "")
+    if emoji and len(emoji) > 2:  # cheap guard against long text
+        emoji = emoji[:2]
+    return {"gift_id": gid, "title": title, "star_count": price, "emoji": emoji}
 
 async def gifts_from_notifier(path: str) -> List[Dict[str,Any]]:
     try:
         if not path or not os.path.exists(path): return []
         raw = await asyncio.to_thread(lambda: open(path,"r",encoding="utf-8").read())
         data = json.loads(raw)
-        items = data["gifts"] if isinstance(data,dict) and "gifts" in data else data
+        items = data.get("gifts", data)
+        if isinstance(items, dict):
+            items = [{"gift_id": k, **v} for k,v in items.items()]
         return [normalize_gift_dict(i) for i in items if isinstance(i, dict)]
     except Exception as e:
         await log_event("ERROR", f"notifier parse error: {e}")
@@ -255,6 +260,8 @@ async def autobuy_loop(bot: Bot):
 
             for g in items:
                 gid, title, price = g["gift_id"], g["title"], int(g["star_count"])
+                if not gid:  # skip malformed
+                    continue
                 ok_id  = (not allow_ids)  or (gid in allow_ids)
                 ok_kw  = (not allow_keys) or any(k.lower() in title.lower() for k in allow_keys)
                 ok_min = (mn<=0) or (price>=mn)
@@ -272,12 +279,11 @@ async def autobuy_loop(bot: Bot):
                                          (gid, title, price, rid, "sent", ts)); await db.commit()
                     RUN["bought"] += 1; RUN["spent"] += price
                     await ledger_add(rid, -price, f"Auto buy: {title}")
-                    await log_event("INFO", f"auto-sent {title} ({price}⭐) -> {rid} [{source}]")
                     if st.get("notify",True):
-                        await bot.send_message(rid, f"Bought {title} for {price}⭐")
+                        await bot.send_message(rid, f"Bought {g.get('emoji','')} {title} for {price}⭐ (id {gid})".strip())
                 except Exception as e:
                     await log_event("ERROR", f"sendGift {gid} -> {rid} failed: {e}")
-            await asyncio.sleep(INTERVAL_FAST if st.get("speed","FAST")=="FAST" else INTERVAL_INSANE if st.get("speed")=="INSANE" else INTERVAL_NORMAL if st.get("speed")=="NORMAL" else INTERVAL_FAST)
+            await asyncio.sleep(INTERVAL_FAST if st.get("speed","FAST")=="FAST" else INTERVAL_INSANE if st.get("speed")=="INSANE" else INTERVAL_NORMAL)
         except Exception as e:
             await log_event("ERROR", f"loop crash: {e}")
             await asyncio.sleep(0.5)
@@ -300,7 +306,50 @@ async def cb_home(c: CallbackQuery):
     st = await get_state()
     await c.message.edit_text("Menu", reply_markup=main_menu(st)); await c.answer()
 
-# profile
+# source/status
+async def notifier_status(st: dict)->Tuple[bool,str,int]:
+    path = st.get("notifier_json") or ""
+    if not path: return False, "No JSON path set.", 0
+    if not os.path.exists(path): return False, f"File not found: {path}", 0
+    items = await gifts_from_notifier(path)
+    if not items: return False, "Parsed 0 gifts (empty or parse error).", 0
+    return True, f"OK: {len(items)} gifts", len(items)
+
+@router.callback_query(F.data == "source:menu")
+async def cb_source_menu(c: CallbackQuery):
+    st = await get_state()
+    ok, msg, cnt = await notifier_status(st)
+    status = f"Notifier status — {msg}" if st.get("feed_mode")=="notifier" else "Notifier status — (using API now)"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Use API",      callback_data="source:set:api"),
+         InlineKeyboardButton(text="Use Notifier", callback_data="source:set:notifier")],
+        [InlineKeyboardButton(text="Set JSON path", callback_data="source:set:path"),
+         InlineKeyboardButton(text="Test Notifier", callback_data="source:test")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
+    ])
+    await c.message.edit_text(f"Current source: {st.get('feed_mode','api').upper()}\nPath: {st.get('notifier_json') or '(none)'}\n{status}",
+                              reply_markup=kb)
+    await c.answer()
+
+@router.callback_query(F.data == "source:test")
+async def cb_source_test(c: CallbackQuery):
+    st = await get_state()
+    ok, msg, cnt = await notifier_status(st)
+    await c.answer(msg, show_alert=True)
+
+@router.callback_query(F.data.startswith("source:set:"))
+async def cb_source_set(c: CallbackQuery):
+    _,_,what = c.data.split(":")
+    st = await get_state()
+    if what in ("api","notifier"):
+        st["feed_mode"] = what; await save_state(st)
+        await c.answer(f"Source → {what.upper()}")
+        await cb_source_menu(c)
+    elif what=="path":
+        await kv_set("pending", {"user": c.from_user.id, "key": "source:path"})
+        await c.message.edit_text("Send full path to notifier JSON file.", reply_markup=back_home()); await c.answer()
+
+# profile / credits
 @router.callback_query(F.data == "profile:open")
 async def cb_profile(c: CallbackQuery):
     try: stars = await TGAPI.get_my_star_balance()
@@ -309,7 +358,7 @@ async def cb_profile(c: CallbackQuery):
     credit = await ledger_balance(owner or c.from_user.id)
     st = await get_state()
     txt = (f"Profile\n"
-           f"Balance (wallet): {stars}⭐\n"
+           f"Wallet balance: {stars}⭐\n"
            f"Internal credit: {credit}⭐\n\n"
            f"Auto-Purchase\n"
            f"Cycles: {st.get('cycles') or '∞'}\n"
@@ -377,28 +426,12 @@ async def cb_filters(c: CallbackQuery):
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
-@router.callback_query(F.data.in_(["set:cycles","set:min","set:max","set:overall","set:supply",
-                                   "lim:set:ids","lim:set:keys","lim:set:window","source:path"]))
-async def cb_prompts(c: CallbackQuery):
-    hints = {
-        "set:cycles":"Send number of cycles (0 = ∞).",
-        "set:min":"Send lower price limit in stars (0 = none).",
-        "set:max":"Send upper price limit in stars (0 = none).",
-        "set:overall":"Send overall stars budget for this run (0 = unlimited).",
-        "set:supply":"Send max pieces to buy this run (0 = unlimited).",
-        "lim:set:ids":"Send comma-separated Gift IDs (empty = any).",
-        "lim:set:keys":"Send comma-separated keywords (e.g., teddy, ring).",
-        "lim:set:window":"Send HH:MM-HH:MM (empty = always).",
-        "source:path":"Send full path to notifier JSON."
-    }
-    await kv_set("pending", {"user": c.from_user.id, "key": c.data})
-    await c.message.edit_text(hints[c.data], reply_markup=back_home()); await c.answer()
-
+# single text handler (for all prompts)
 @router.message(F.text)
 async def on_text(m: Message):
     pend = await kv_get("pending")
     if not pend or pend.get("user") != m.from_user.id: return
-    key = pend["key"]; t = (m.text or "").strip(); st = await get_state()
+    key = pend.get("key"); t = (m.text or "").strip(); st = await get_state()
     try:
         if key=="set:cycles": st["cycles"]=max(0,int(t)) if t else 0; await m.reply(f"Cycles -> {st['cycles'] or '∞'}")
         elif key=="set:min": st["min_price"]=max(0,int(t)) if t else 0; await m.reply(f"Lower -> {st['min_price']}⭐")
@@ -408,13 +441,17 @@ async def on_text(m: Message):
         elif key=="lim:set:ids": st["allow_ids"]=[x.strip() for x in t.split(",") if x.strip()]; await m.reply("IDs updated")
         elif key=="lim:set:keys": st["allow_keys"]=[x.strip() for x in t.split(",") if x.strip()]; await m.reply("Keywords updated")
         elif key=="lim:set:window": st["window"]=t; await m.reply(f"Window -> {st['window'] or '(always)'}")
-        elif key=="source:path": st["notifier_json"]=t; await m.reply(f"Notifier path set")
+        elif key=="source:path": st["notifier_json"]=t; await m.reply("Notifier path set")
+        elif key=="refund:add":
+            amt = int(t); owner = await get_owner_id() or m.from_user.id
+            await ledger_add(owner, amt, "Manual credit"); bal = await ledger_balance(owner)
+            await m.reply(f"Credit updated. Internal credit: {bal}⭐.")
         await save_state(st)
     except Exception as e:
         await m.reply(f"Input error: {e}")
     await kv_set("pending", None)
 
-# catalogue (clean layout: two buttons per row, no markdown **)
+# catalogue — emoji + id; two buttons per row
 @router.callback_query(F.data.startswith("cata:"))
 async def cb_cata(c: CallbackQuery):
     p = c.data.split(":")
@@ -427,20 +464,21 @@ async def cb_cata(c: CallbackQuery):
     start = page*per_page; end = min(total, start+per_page)
     view = gifts[start:end]
     lines = [f"Gift Catalog ({source}) page {page+1}/{(total+per_page-1)//per_page or 1}"]
-    kb_rows = []
+    rows = []
     for g in view:
-        gid, title, price = g["gift_id"], g["title"], int(g["star_count"])
-        lines.append(f"• {title} — {price}⭐")
-        kb_rows.append([
+        gid, title, price, emoji = g["gift_id"], g["title"], int(g["star_count"]), g.get("emoji","")
+        title_disp = f"{emoji} {title}".strip()
+        lines.append(f"• {title_disp} — {price}⭐  (id {gid})")
+        rows.append([
             InlineKeyboardButton(text=f"Buy {price}⭐", callback_data=f"cata:buy:{gid}:{price}:{title[:40]}"),
-            InlineKeyboardButton(text=f"+Allow", callback_data=f"cata:allow:{gid}")
+            InlineKeyboardButton(text="+Allow", callback_data=f"cata:allow:{gid}")
         ])
     nav=[]
     if start>0: nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"cata:{page-1}"))
     if end<total: nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"cata:{page+1}"))
-    if nav: kb_rows.append(nav)
-    kb_rows.append([InlineKeyboardButton(text="Back", callback_data="home")])
-    await c.message.edit_text("\n".join(lines) if view else "No gifts right now.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    if nav: rows.append(nav)
+    rows.append([InlineKeyboardButton(text="Back", callback_data="home")])
+    await c.message.edit_text("\n".join(lines) if view else "No gifts right now.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await c.answer()
 
 @router.callback_query(F.data.startswith("cata:allow:"))
@@ -461,7 +499,7 @@ async def cb_cata_buy(c: CallbackQuery, bot: Bot):
                              (gid, title, int(price), rid, "manual", ts)); await db.commit()
         await ledger_add(rid, -int(price), f"Manual buy: {title}")
         await c.answer("Sent!")
-        await bot.send_message(rid, f"Sent {title} for {price}⭐")
+        await bot.send_message(rid, f"Sent {title} for {price}⭐ (id {gid})")
     except Exception as e:
         await c.answer(f"Send failed: {e}", show_alert=True)
 
@@ -473,12 +511,12 @@ async def cb_refund_menu(c: CallbackQuery):
         [InlineKeyboardButton(text="Add manual credit", callback_data="refund:add")],
         [InlineKeyboardButton(text="Back", callback_data="profile:open")]
     ])
-    await c.message.edit_text("Refunds / Credits\n— credit adds to internal balance; future sends will still cost Stars on Telegram.", reply_markup=kb); await c.answer()
+    await c.message.edit_text("Refunds / Credits\n— credits are internal; Telegram Stars transactions are final.", reply_markup=kb); await c.answer()
 
 @router.callback_query(F.data == "refund:last")
 async def cb_refund_last(c: CallbackQuery):
     owner = await get_owner_id()
-    if c.from_user.id != (owner or c.from_user.id): 
+    if c.from_user.id != (owner or c.from_user.id):
         await c.answer("Only owner", show_alert=True); return
     async with open_db() as db:
         async with db.execute("SELECT id,gift_id,title,stars FROM purchases ORDER BY id DESC LIMIT 1") as cur:
@@ -487,15 +525,14 @@ async def cb_refund_last(c: CallbackQuery):
     _,_,title,stars = row
     await ledger_add(owner, int(stars), f"Refund credit: {title}")
     bal = await ledger_balance(owner)
-    await c.answer("Credited")
-    await c.message.edit_text(f"Refunded (credit) {stars}⭐ for {title}\nInternal credit now: {bal}⭐", reply_markup=back_home())
+    await c.message.edit_text(f"Refunded (credit) {stars}⭐ for {title}\nInternal credit now: {bal}⭐", reply_markup=back_home()); await c.answer()
 
 @router.callback_query(F.data == "refund:add")
 async def cb_refund_add(c: CallbackQuery):
     await kv_set("pending", {"user": c.from_user.id, "key": "refund:add"})
-    await c.message.edit_text("Send a positive or negative stars amount to credit/debit internally.\nExample: 50", reply_markup=back_home()); await c.answer()
+    await c.message.edit_text("Send a positive/negative stars amount to credit/debit internally.\nExample: 50", reply_markup=back_home()); await c.answer()
 
-# top up (XTR)
+# top up
 @router.callback_query(F.data == "topup:menu")
 async def cb_topup_menu(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -525,16 +562,15 @@ async def paid(m: Message):
     credit = await ledger_balance(owner)
     await m.reply(f"Received {amt}⭐. Internal credit: {credit}⭐.")
 
-# health/logs (trimmed)
+# health/logs
 @router.callback_query(F.data == "health:run")
 async def cb_health(c: CallbackQuery, bot: Bot):
-    try:
-        stars = await TGAPI.get_my_star_balance()
-    except Exception:
-        stars = 0
+    try: stars = await TGAPI.get_my_star_balance()
+    except Exception: stars = 0
     st = await get_state()
     source, gifts = await get_gifts(st)
-    await c.message.edit_text(f"Health\nWallet: {stars}⭐\nSource: {source}\nGifts available: {len(gifts)}", reply_markup=back_home())
+    ok, msg, _ = await notifier_status(st)
+    await c.message.edit_text(f"Health\nWallet: {stars}⭐\nSource: {source}\nNotifier: {msg}\nGifts available: {len(gifts)}", reply_markup=back_home())
     await c.answer()
 
 @router.callback_query(F.data == "logs:open")
@@ -544,21 +580,6 @@ async def cb_logs(c: CallbackQuery):
             rows = await cur.fetchall()
     lines = [(datetime.fromtimestamp(ts).strftime('%H:%M:%S')+f" [{lvl}] {msg}") for ts,lvl,msg in rows]
     await c.message.edit_text("Recent logs\n" + ("\n".join(lines) if lines else "Empty"), reply_markup=back_home()); await c.answer()
-
-# extra text hook for manual credit
-@router.message(F.text)
-async def on_text_credit(m: Message):
-    pend = await kv_get("pending")
-    if not pend or pend.get("user") != m.from_user.id or pend.get("key")!="refund:add": return
-    try:
-        amt = int((m.text or "0").strip())
-        owner = await get_owner_id() or m.from_user.id
-        await ledger_add(owner, amt, "Manual credit")
-        credit = await ledger_balance(owner)
-        await m.reply(f"Credit updated. Internal credit: {credit}⭐.")
-    except Exception as e:
-        await m.reply(f"Input error: {e}")
-    await kv_set("pending", None)
 
 # bootstrap
 async def main():
