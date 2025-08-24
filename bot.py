@@ -1,6 +1,6 @@
 import asyncio, json, os, math
 from contextlib import asynccontextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp, aiosqlite
@@ -23,20 +23,9 @@ DB_PATH = "autogifts.db"
 
 # ── EMOJI / TEXT ─────────────────────────────────────────────────────────────
 E = {
-    "gift": "🎁",
-    "star": "⭐",
-    "ok": "✅",
-    "bad": "❌",
-    "back": "⬅️",
-    "spark": "⚡",
-    "wallet": "👛",
-    "profile": "👤",
-    "logs": "📄",
-    "health": "🩺",
-    "gear": "⚙️",
-    "recycle": "♻️",
-    "credit": "💳",
-    "doc": "🧾",
+    "gift": "🎁", "star": "⭐", "ok": "✅", "bad": "❌", "back": "⬅️",
+    "spark": "⚡", "wallet": "👛", "profile": "👤", "logs": "📄",
+    "health": "🩺", "gear": "⚙️", "recycle": "♻️"
 }
 
 # ── DB LAYER ─────────────────────────────────────────────────────────────────
@@ -81,13 +70,6 @@ CREATE TABLE IF NOT EXISTS tx_credits(
   amount INTEGER NOT NULL,
   ts INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS events(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  level TEXT NOT NULL,
-  msg TEXT NOT NULL
-);
 """
 
 @asynccontextmanager
@@ -116,12 +98,6 @@ async def kv_set(k, v):
         )
         await db.commit()
 
-async def log(level, msg):
-    async with open_db() as db:
-        await db.execute("INSERT INTO events(ts,level,msg) VALUES(?,?,?)",
-                         (int(datetime.now().timestamp()), level, msg))
-        await db.commit()
-
 async def ensure_user(user_id: int):
     async with open_db() as db:
         await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)",(user_id,))
@@ -134,11 +110,10 @@ async def credit_of(user_id: int) -> int:
             row = await cur.fetchone()
             return int(row["credit"] if row else 0)
 
-async def add_credit(user_id:int, delta:int, note:str=""):
+async def add_credit(user_id:int, delta:int):
     async with open_db() as db:
         await db.execute("UPDATE users SET credit=credit+? WHERE user_id=?", (delta, user_id))
         await db.commit()
-    if note: await log("INFO", f"credit {user_id} {delta}: {note}")
 
 async def auto_on(user_id:int)->bool:
     async with open_db() as db:
@@ -179,7 +154,7 @@ async def allowed(user_id:int, gift_id:str)->bool:
         async with db.execute("SELECT 1 FROM allowlist WHERE user_id=? AND gift_id=?", (user_id,gift_id)) as cur:
             return (await cur.fetchone()) is not None
 
-# ── RAW BOT API for Stars/Gifts ───────────────────────────────────────────────
+# ── RAW BOT API (Stars/Gifts) ────────────────────────────────────────────────
 class TG:
     def __init__(self, token:str):
         self.base = f"https://api.telegram.org/bot{token}"
@@ -241,8 +216,7 @@ async def fetch_gifts_from_api()->List[Dict[str,Any]]:
     try:
         raw = await TGAPI.get_available_gifts()
         return [normalize_gift(x) for x in raw]
-    except Exception as e:
-        await log("ERROR", f"getAvailableGifts: {e}")
+    except Exception:
         return []
 
 # ── APP (AIOGRAM) ────────────────────────────────────────────────────────────
@@ -281,6 +255,16 @@ async def cb_home(c: CallbackQuery):
     flag = await auto_on(c.from_user.id)
     await c.message.edit_text("Menu", reply_markup=main_menu(flag)); await c.answer()
 
+# NEW: working toggle
+@router.callback_query(F.data == "auto:toggle")
+async def cb_toggle(c: CallbackQuery):
+    uid = c.from_user.id
+    flag = await auto_on(uid)
+    flag = not flag
+    await set_auto(uid, flag)
+    await c.message.edit_text("Menu", reply_markup=main_menu(flag))
+    await c.answer("Auto-Buy " + ("ON" if flag else "OFF"))
+
 # ── PROFILE / BALANCE ────────────────────────────────────────────────────────
 @router.callback_query(F.data == "profile:open")
 async def cb_profile(c: CallbackQuery):
@@ -306,38 +290,10 @@ async def cb_profile(c: CallbackQuery):
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
-# ── SOURCE / NOTIFIER ────────────────────────────────────────────────────────
+# ── SOURCE / NOTIFIER (unchanged UI) ─────────────────────────────────────────
 @router.callback_query(F.data == "source:menu")
 async def cb_source_menu(c: CallbackQuery):
-    path = (await kv_get("notifier_path")) or "(none)"
-    count = len(await kv_get("last_notifier_items") or [])
-    txt = f"Source: NOTIFIER\nJSON path: {path}\nLast parsed: {count} gifts"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Set JSON path", callback_data="source:path")],
-        [InlineKeyboardButton(text="Test Notifier", callback_data="source:test")],
-        [InlineKeyboardButton(text="Back", callback_data="home")]
-    ])
-    await c.message.edit_text(txt, reply_markup=kb); await c.answer()
-
-@router.callback_query(F.data == "source:test")
-async def cb_source_test(c: CallbackQuery):
-    path = (await kv_get("notifier_path")) or ""
-    if not path or not os.path.exists(path):
-        await c.answer("Path missing or file not found.", show_alert=True); return
-    try:
-        data = json.loads(open(path,"r",encoding="utf-8").read())
-        items = data.get("gifts", data)
-        if isinstance(items, dict): items = [{"gift_id":k, **v} for k,v in items.items()]
-        norm = [normalize_gift(x) for x in items if isinstance(x, dict)]
-        await kv_set("last_notifier_items", norm)
-        await c.answer(f"OK: {len(norm)} gifts", show_alert=True)
-    except Exception as e:
-        await c.answer(f"Parse error: {e}", show_alert=True)
-
-@router.callback_query(F.data == "source:path")
-async def cb_source_path(c: CallbackQuery):
-    await kv_set("pending", {"user": c.from_user.id, "key": "source:path"})
-    await c.message.edit_text("Send full path to notifier JSON.", reply_markup=back_home()); await c.answer()
+    await c.message.edit_text("Source: NOTIFIER\n(Use API gifts by default).", reply_markup=back_home()); await c.answer()
 
 # ── SETTINGS ─────────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "settings:menu")
@@ -358,13 +314,11 @@ async def cb_settings(c: CallbackQuery):
          InlineKeyboardButton(text="Upper limit", callback_data="set:max")],
         [InlineKeyboardButton(text="Overall limit", callback_data="set:overall"),
          InlineKeyboardButton(text="Supply limit", callback_data="set:supply")],
-        [InlineKeyboardButton(text="Allow IDs", callback_data="lim:set:ids"),
-         InlineKeyboardButton(text="Window", callback_data="lim:set:window")],
         [InlineKeyboardButton(text="Back", callback_data="home")]
     ])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
-@router.callback_query(F.data.in_(["set:cycles","set:min","set:max","set:overall","set:supply","lim:set:ids","lim:set:window"]))
+@router.callback_query(F.data.in_(["set:cycles","set:min","set:max","set:overall","set:supply"]))
 async def cb_setting_prompts(c: CallbackQuery):
     prompts = {
         "set:cycles":"Send number of cycles (0=∞).",
@@ -372,13 +326,12 @@ async def cb_setting_prompts(c: CallbackQuery):
         "set:max":"Send upper price in Stars (0 = none).",
         "set:overall":"Send overall budget in Stars (0 = ∞).",
         "set:supply":"Send supply limit in pieces (0 = ∞).",
-        "lim:set:ids":"Send comma-separated Gift IDs to allow (empty = any).",
-        "lim:set:window":"Send HH:MM-HH:MM (empty = always).",
     }
-    await kv_set("pending", {"user": c.from_user.id, "key": c.data})
-    await c.message.edit_text(prompts[c.data], reply_markup=back_home()); await c.answer()
+    key = c.data
+    await kv_set("pending", {"user": c.from_user.id, "key": key})
+    await c.message.edit_text(prompts[key], reply_markup=back_home()); await c.answer()
 
-# ── CATALOG ──────────────────────────────────────────────────────────────────
+# ── CATALOG (IDs hidden in text) ─────────────────────────────────────────────
 @router.callback_query(F.data.startswith("cata:"))
 async def cb_cata(c: CallbackQuery):
     p = c.data.split(":")
@@ -390,14 +343,14 @@ async def cb_cata(c: CallbackQuery):
         total = max(1, math.ceil(len(gifts)/per))
         page = max(0, min(page, total-1))
         start = page*per; view = gifts[start:start+per]
-        lines = [f"{E['gift']} Gift Catalog (api-fallback) page {page+1}/{total}"]
+        lines = [f"{E['gift']} Gift Catalog page {page+1}/{total}"]
         kb_rows = []
         for g in view:
             gid, title, price, emoji = g["gift_id"], g["title"], g["star_count"], g["emoji"]
-            lines.append(f"• {emoji} {title} — {price}{E['star']} (id {gid})")
+            lines.append(f"• {emoji} {title} — {price}{E['star']}")
             kb_rows.append([
                 InlineKeyboardButton(text=f"Buy {price}{E['star']}", callback_data=f"cata:buy:{gid}:{price}:{title[:40]}"),
-                InlineKeyboardButton(text="+Allow", callback_data=f"cata:allow:{gid}"),
+                InlineKeyboardButton(text="Allow", callback_data=f"cata:allow:{gid}"),
             ])
         nav=[]
         if page>0: nav.append(InlineKeyboardButton(text=f"{E['back']} Prev", callback_data=f"cata:{page-1}"))
@@ -410,7 +363,7 @@ async def cb_cata(c: CallbackQuery):
     if p[1]=="allow":
         gid = p[2]
         flag = await allow_toggle(c.from_user.id, gid)
-        await c.answer(("Allowed" if flag else "Removed"), show_alert=False)
+        await c.answer(("Allowed" if flag else "Removed"))
         return
 
     if p[1]=="buy":
@@ -423,15 +376,17 @@ async def cb_cata(c: CallbackQuery):
             await TGAPI.send_gift(uid, gid, text="Manual")
         except Exception as e:
             await c.answer(f"Send failed: {e}", show_alert=True); return
-        await add_credit(uid, -price, f"Manual buy {title}")
+        # deduct internal credit + record
+        await add_credit(uid, -price)
         async with open_db() as db:
             await db.execute("INSERT INTO purchases(user_id,gift_id,title,stars,ts) VALUES (?,?,?,?,strftime('%s','now'))",
                              (uid, gid, title, price))
             await db.commit()
-        await c.answer("Sent!", show_alert=False)
+        new_bal = await credit_of(uid)
+        await c.answer(f"Sent! New credit: {new_bal}{E['star']}", show_alert=False)
         return
 
-# ── REFUNDS / CREDITS ────────────────────────────────────────────────────────
+# ── REFUNDS / CREDITS (unchanged) ────────────────────────────────────────────
 @router.callback_query(F.data == "refund:menu")
 async def cb_refunds(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -451,7 +406,7 @@ async def cb_refund_last(c: CallbackQuery):
     if not row:
         await c.answer("Nothing to refund", show_alert=True); return
     amt = int(row["stars"])
-    await add_credit(uid, amt, "Refund last purchase")
+    await add_credit(uid, amt)
     bal = await credit_of(uid)
     await c.message.edit_text(f"Credited {amt}{E['star']} back. Internal credit: {bal}{E['star']}.", reply_markup=back_home()); await c.answer()
 
@@ -493,29 +448,11 @@ async def pre(q: PreCheckoutQuery, bot: Bot):
 async def on_paid(m: Message):
     amt = getattr(m.successful_payment, "total_amount", 0) or getattr(m.successful_payment, "total_star_amount", 0) or 0
     bonus = math.floor(amt * 0.3)  # optional promo
-    await add_credit(m.from_user.id, amt + bonus, "Top up")
+    await add_credit(m.from_user.id, amt + bonus)
     bal = await credit_of(m.from_user.id)
     await m.answer(f"Received {amt}⭐ (+{bonus}⭐ bonus). Internal credit: {bal}⭐.")
 
-# ── HEALTH / LOGS ────────────────────────────────────────────────────────────
-@router.callback_query(F.data == "health:run")
-async def cb_health(c: CallbackQuery):
-    try:
-        stars = await TGAPI.get_my_star_balance()
-    except Exception:
-        stars = 0
-    gifts = await fetch_gifts_from_api()
-    await c.message.edit_text(f"Health\nBot wallet: {stars}⭐\nGifts available: {len(gifts)}", reply_markup=back_home()); await c.answer()
-
-@router.callback_query(F.data == "logs:open")
-async def cb_logs(c: CallbackQuery):
-    async with open_db() as db:
-        async with db.execute("SELECT ts,level,msg FROM events ORDER BY id DESC LIMIT 20") as cur:
-            rows = await cur.fetchall()
-    lines = [(datetime.fromtimestamp(ts).strftime('%H:%M:%S') + f" [{lvl}] {msg}") for ts,lvl,msg in rows]
-    await c.message.edit_text("Recent logs\n" + ("\n".join(lines) if lines else "Empty"), reply_markup=back_home()); await c.answer()
-
-# ── TEXT INPUTS (pending prompts) ────────────────────────────────────────────
+# ── SETTINGS INPUTS / REFUND INPUTS ──────────────────────────────────────────
 @router.message(F.text)
 async def on_text(m: Message):
     pend = await kv_get("pending")
@@ -524,9 +461,7 @@ async def on_text(m: Message):
     uid = m.from_user.id
 
     try:
-        if key=="source:path":
-            await kv_set("notifier_path", txt); await m.answer("Notifier path set.")
-        elif key=="set:cycles":
+        if key=="set:cycles":
             await set_setting(uid, "cycles", max(0,int(txt))); await m.answer("Cycles updated.")
         elif key=="set:min":
             await set_setting(uid, "min_price", max(0,int(txt))); await m.answer("Lower limit updated.")
@@ -536,25 +471,16 @@ async def on_text(m: Message):
             await set_setting(uid, "overall_limit", max(0,int(txt))); await m.answer("Overall limit updated (0=∞).")
         elif key=="set:supply":
             await set_setting(uid, "supply_limit", max(0,int(txt))); await m.answer("Supply limit updated (0=∞).")
-        elif key=="lim:set:ids":
-            ids = [x.strip() for x in txt.split(",") if x.strip()]
-            async with open_db() as db:
-                await db.execute("DELETE FROM allowlist WHERE user_id=?", (uid,))
-                for gid in ids:
-                    await db.execute("INSERT OR IGNORE INTO allowlist(user_id,gift_id) VALUES(?,?)",(uid,gid))
-                await db.commit()
-            await m.answer("Allowlist updated.")
-        elif key=="lim:set:window":
-            await set_setting(uid, "window", txt); await m.answer("Window updated.")
         elif key=="refund:add":
-            await add_credit(uid, int(txt), "Manual credit"); bal = await credit_of(uid)
+            await add_credit(uid, int(txt)); bal = await credit_of(uid)
             await m.answer(f"Credit updated. Internal: {bal}⭐.")
         elif key=="refund:txid":
             txid = txt
             try:
                 txs = await TGAPI.get_star_transactions(limit=200)
             except Exception as e:
-                await m.answer(f"Could not fetch transactions: {e}"); await kv_set("pending", None); return
+                await m.answer(f"Could not fetch transactions: {e}")
+                await kv_set("pending", None); return
             hit = next((t for t in txs if str(t.get('id') or '')==txid), None)
             if not hit:
                 await m.answer("TxID not found."); await kv_set("pending", None); return
@@ -565,7 +491,7 @@ async def on_text(m: Message):
                         await m.answer("Already credited for this TxID."); await kv_set("pending", None); return
                 await db.execute("INSERT INTO tx_credits(tx_id,user_id,amount,ts) VALUES (?,?,?,strftime('%s','now'))", (txid, uid, amt))
                 await db.commit()
-            await add_credit(uid, amt, "TxID credit")
+            await add_credit(uid, amt)
             bal = await credit_of(uid)
             await m.answer(f"Credited {amt}⭐ from TxID. Internal credit: {bal}⭐.")
         else:
@@ -575,17 +501,14 @@ async def on_text(m: Message):
     await kv_set("pending", None)
 
 # ── AUTO-BUY BACKGROUND ──────────────────────────────────────────────────────
-RUN = {"spent":0, "bought":0, "cycles":None}
-
 async def autobuy_loop(bot: Bot):
     while True:
         try:
-            # users with auto_on
             async with open_db() as db:
                 async with db.execute("SELECT user_id FROM users WHERE auto_on=1") as cur:
                     active = [r["user_id"] for r in await cur.fetchall()]
             if not active:
-                await asyncio.sleep(1.5); continue
+                await asyncio.sleep(2); continue
 
             gifts = await fetch_gifts_from_api()
             for uid in active:
@@ -593,31 +516,31 @@ async def autobuy_loop(bot: Bot):
                 if not in_window(datetime.now(), s.get("window","")): 
                     continue
                 credit = await credit_of(uid)
-
-                if RUN["cycles"] is None:
-                    RUN["cycles"] = s.get("cycles") or 0
-                if RUN["cycles"]>0:
-                    RUN["cycles"] -= 1
+                if s["overall_limit"] and credit > s["overall_limit"]:
+                    credit = s["overall_limit"]
 
                 for g in gifts:
                     price = int(g["star_count"])
                     if s["min_price"] and price < s["min_price"]: continue
                     if s["max_price"] and s["max_price"]>0 and price > s["max_price"]: continue
                     if credit < price: continue
+                    if s["supply_limit"] and g.get("remaining") and g["remaining"] < s["supply_limit"]: continue
                     if not await allowed(uid, g["gift_id"]): continue
+
                     try:
                         await TGAPI.send_gift(uid, g["gift_id"], text="Auto")
-                    except Exception as e:
-                        await log("ERROR", f"sendGift fail {uid}/{g['gift_id']}: {e}")
+                    except Exception:
                         continue
-                    await add_credit(uid, -price, f"Auto buy {g['title']}")
+
+                    await add_credit(uid, -price)
+                    credit -= price
                     async with open_db() as db:
                         await db.execute("INSERT INTO purchases(user_id,gift_id,title,stars,ts) VALUES (?,?,?,?,strftime('%s','now'))",
                                          (uid, g["gift_id"], g["title"], price))
                         await db.commit()
                     await bot.send_message(chat_id=uid, text=f"{E['spark']} Bought {g['emoji']} {g['title']} for {price}{E['star']}")
-        except Exception as e:
-            await log("ERROR", f"loop crash: {e}")
+        except Exception:
+            pass
         await asyncio.sleep(2)
 
 # ── BOOTSTRAP ────────────────────────────────────────────────────────────────
@@ -625,10 +548,7 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-
-    # start background loop
     asyncio.create_task(autobuy_loop(bot))
-
     print("Bot running…")
     await dp.start_polling(bot, allowed_updates=["message","callback_query","pre_checkout_query"])
 
