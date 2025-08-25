@@ -20,7 +20,6 @@ from aiogram.types import (
     Message,
     PreCheckoutQuery,
 )
-
 from dotenv import load_dotenv
 
 # ───────────────────────── Config ─────────────────────────
@@ -30,8 +29,7 @@ DB_PATH = os.getenv("DB_PATH", "./dream.sqlite3")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is missing in .env")
 
-# Private bot: only these users can use it
-ADMINS = {7940894807, 5770074932}
+ADMINS = {7940894807, 5770074932}  # private bot
 
 # Stars rules (custom deposit guard)
 MIN_XTR, MAX_XTR = 15, 200000
@@ -70,11 +68,12 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ───────────────────────── DB ─────────────────────────
-async def db():
-    return await aiosqlite.connect(DB_PATH)
+def db():
+    # IMPORTANT: return the connection (do NOT await here)
+    return aiosqlite.connect(DB_PATH)
 
 async def init_db():
-    async with await db() as con:
+    async with db() as con:
         await con.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 user_id        INTEGER PRIMARY KEY,
@@ -111,7 +110,7 @@ async def init_db():
         await con.commit()
 
 async def db_get_user(uid: int) -> Optional[dict]:
-    async with await db() as con:
+    async with db() as con:
         cur = await con.execute("SELECT * FROM users WHERE user_id=?", (uid,))
         row = await cur.fetchone()
         if not row:
@@ -123,7 +122,7 @@ async def db_save_user(uid: int, u: dict):
     fields = [k for k in DEFAULT_USER.keys()]
     placeholders = ",".join(f"{k}=?" for k in fields)
     values = [int(u[k]) if isinstance(DEFAULT_USER[k], bool) else u[k] for k in fields]
-    async with await db() as con:
+    async with db() as con:
         await con.execute(
             f"INSERT INTO users(user_id,{','.join(fields)}) "
             f"VALUES(?,{','.join('?' for _ in fields)}) "
@@ -133,12 +132,12 @@ async def db_save_user(uid: int, u: dict):
         await con.commit()
 
 async def db_all_users() -> list[int]:
-    async with await db() as con:
+    async with db() as con:
         cur = await con.execute("SELECT user_id FROM users")
         return [r[0] for r in await cur.fetchall()]
 
 async def db_all_notifier_ids() -> list[int]:
-    async with await db() as con:
+    async with db() as con:
         cur = await con.execute("SELECT DISTINCT notifier_id FROM users WHERE notifier_id IS NOT NULL")
         out = []
         for r in await cur.fetchall():
@@ -149,7 +148,7 @@ async def db_all_notifier_ids() -> list[int]:
         return out
 
 async def db_log(uid: int, kind: str, message: str):
-    async with await db() as con:
+    async with db() as con:
         await con.execute(
             "INSERT INTO logs(user_id, kind, message, ts) VALUES(?,?,?,?)",
             (uid, kind, message, int(datetime.now(tz=timezone.utc).timestamp()))
@@ -157,7 +156,7 @@ async def db_log(uid: int, kind: str, message: str):
         await con.commit()
 
 async def db_last_logs(uid: int, limit=12) -> list[tuple[str,str]]:
-    async with await db() as con:
+    async with db() as con:
         cur = await con.execute(
             "SELECT kind, message FROM logs WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (uid, limit)
@@ -205,7 +204,7 @@ def main_menu_kb(u: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👤 Profile", callback_data="menu:profile"),
          InlineKeyboardButton("⭐ Deposit", callback_data="menu:deposit")],
         [InlineKeyboardButton("🚀 Test Event", callback_data="menu:test"),
-         InlineKeyboardButton("🗒️ Logs", callback_data="menu:logs")],
+          InlineKeyboardButton("🗒️ Logs", callback_data="menu:logs")],
         [InlineKeyboardButton("🆘 Support", callback_data="menu:support")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -434,6 +433,7 @@ async def try_debit(uid: int, cost: int) -> tuple[bool, str]:
 async def send_fake_gift(chat_id: int, emoji: str, name: str, total_cost: int, qty: int, mode: str):
     caption = f"<b>Gift from Dream</b>\nMode: <i>{mode}</i>\n{emoji} {name} × <b>{qty}</b>\nSpent: <b>{total_cost}⭐</b>"
     await bot.send_message(chat_id, caption)
+
 @dp.callback_query(F.data.startswith("buy:"))
 async def on_buy(cq: types.CallbackQuery):
     # data: buy:<gid>:<count>
@@ -606,9 +606,9 @@ async def try_auto_buy(uid: int):
         await db_log(uid, "AUTO", "No gift matches price filters")
         return
     cycles = u.get("cycles", 1)
-    qty = max(1, min(cycles, u.get("supply_limit", cycles) or cycles))
-    # Conservative: buy 1 per trigger to stay safe (avoid accidental burn)
-    qty = 1 if qty <= 0 else 1
+    qty = 1 if cycles <= 0 else 1  # conservative: buy 1 per trigger
+    if u.get("supply_limit", 0):
+        qty = min(qty, u["supply_limit"])
     total = g["price"] * qty
     ok, reason = await try_debit(uid, total)
     if not ok:
@@ -617,13 +617,12 @@ async def try_auto_buy(uid: int):
     await db_log(uid, "AUTO", f"Bought {g['name']}×{qty} cost={total}")
     await send_fake_gift(uid, g["emoji"], g["name"], total, qty, "Auto")
 
-# ───────────────────────── Back to main ─────────────────────────
+# ───────────────────────── Back to main & commands ─────────────────────────
 @dp.callback_query(F.data == "back:main")
 async def back_main(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
     await cq.message.edit_text("Menu", reply_markup=main_menu_kb(u))
 
-# ───────────────────────── Commands: /menu /deposit /support ─────────────────────────
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
     if not private_guard(m): 
