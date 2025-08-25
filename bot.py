@@ -2,10 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
+from typing import Optional
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -15,25 +18,22 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
+
 from dotenv import load_dotenv
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / Globals
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Config ─────────────────────────
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "./dream.sqlite3")
-
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is missing in .env")
 
-# Private bot: only these user IDs can use it
+# Private bot: only these users can use it
 ADMINS = {7940894807, 5770074932}
 
-# Star limits (custom deposit guard)
+# Stars rules (custom deposit guard)
 MIN_XTR, MAX_XTR = 15, 200000
 
 # Catalog (extend as needed)
@@ -63,20 +63,13 @@ DEFAULT_USER = {
     "notifier_id": None,
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(name)s :: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(name)s :: %(message)s")
 log = logging.getLogger("dream")
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DB
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── DB ─────────────────────────
 async def db():
     return await aiosqlite.connect(DB_PATH)
 
@@ -84,40 +77,40 @@ async def init_db():
     async with await db() as con:
         await con.execute("""
             CREATE TABLE IF NOT EXISTS users(
-                user_id      INTEGER PRIMARY KEY,
-                auto_on      INTEGER DEFAULT 0,
-                notify_on    INTEGER DEFAULT 1,
-                cycles       INTEGER DEFAULT 1,
-                lower_limit  INTEGER DEFAULT 0,
-                upper_limit  INTEGER DEFAULT 0,
-                overall_limit INTEGER DEFAULT 0,
-                supply_limit INTEGER DEFAULT 0,
-                daily_budget INTEGER DEFAULT 0,
-                spent_today  INTEGER DEFAULT 0,
-                credit       INTEGER DEFAULT 0,
-                notifier_id  INTEGER
+                user_id        INTEGER PRIMARY KEY,
+                auto_on        INTEGER DEFAULT 0,
+                notify_on      INTEGER DEFAULT 1,
+                cycles         INTEGER DEFAULT 1,
+                lower_limit    INTEGER DEFAULT 0,
+                upper_limit    INTEGER DEFAULT 0,
+                overall_limit  INTEGER DEFAULT 0,
+                supply_limit   INTEGER DEFAULT 0,
+                daily_budget   INTEGER DEFAULT 0,
+                spent_today    INTEGER DEFAULT 0,
+                credit         INTEGER DEFAULT 0,
+                notifier_id    INTEGER
             )
         """)
         await con.execute("""
             CREATE TABLE IF NOT EXISTS payments(
-                tx_id     TEXT PRIMARY KEY,
-                user_id   INTEGER,
-                amount    INTEGER,
-                ts        INTEGER
+                tx_id    TEXT PRIMARY KEY,
+                user_id  INTEGER,
+                amount   INTEGER,
+                ts       INTEGER
             )
         """)
         await con.execute("""
             CREATE TABLE IF NOT EXISTS logs(
-                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                kind  TEXT,
+                kind    TEXT,
                 message TEXT,
-                ts    INTEGER
+                ts      INTEGER
             )
         """)
         await con.commit()
 
-async def db_get_user(uid: int) -> dict | None:
+async def db_get_user(uid: int) -> Optional[dict]:
     async with await db() as con:
         cur = await con.execute("SELECT * FROM users WHERE user_id=?", (uid,))
         row = await cur.fetchone()
@@ -144,6 +137,17 @@ async def db_all_users() -> list[int]:
         cur = await con.execute("SELECT user_id FROM users")
         return [r[0] for r in await cur.fetchall()]
 
+async def db_all_notifier_ids() -> list[int]:
+    async with await db() as con:
+        cur = await con.execute("SELECT DISTINCT notifier_id FROM users WHERE notifier_id IS NOT NULL")
+        out = []
+        for r in await cur.fetchall():
+            try:
+                out.append(int(r[0]))
+            except:
+                pass
+        return out
+
 async def db_log(uid: int, kind: str, message: str):
     async with await db() as con:
         await con.execute(
@@ -160,7 +164,7 @@ async def db_last_logs(uid: int, limit=12) -> list[tuple[str,str]]:
         )
         return await cur.fetchall()
 
-# Helpers that enforce defaults
+# ensure defaults
 async def get_user(uid: int) -> dict:
     u = await db_get_user(uid)
     if not u:
@@ -182,20 +186,12 @@ async def set_user(uid: int, **updates):
     await db_save_user(uid, u)
     return u
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FSM
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── FSM ─────────────────────────
 class Entry(StatesGroup):
-    field = State()         # which field we are asking for (string)
-    deposit = State()       # deposit custom amount
+    field = State()    # which field we are asking for
+    deposit = State()  # deposit custom amount
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# UI helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── UI helpers ─────────────────────────
 def pretty_inf(n: int, suffix="⭐"):
     return f"∞{suffix if suffix else ''}" if not n or n < 0 else f"{n}{suffix}"
 
@@ -210,7 +206,7 @@ def main_menu_kb(u: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("⭐ Deposit", callback_data="menu:deposit")],
         [InlineKeyboardButton("🚀 Test Event", callback_data="menu:test"),
          InlineKeyboardButton("🗒️ Logs", callback_data="menu:logs")],
-        [InlineKeyboardButton("🆘 Support", callback_data="menu:support")]
+        [InlineKeyboardButton("🆘 Support", callback_data="menu:support")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -276,27 +272,18 @@ def deposit_kb():
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Access guard
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Access guard ─────────────────────────
 def private_guard(m: Message) -> bool:
     return m.from_user and m.from_user.id in ADMINS
 
 @dp.message()
-async def guard_all(m: Message, event=None):
+async def guard_all(m: Message):
     if not private_guard(m):
-        # show minimal locked UI
         if m.text and (m.text.startswith("/") or m.text.lower() in {"menu", "start"}):
             await m.answer("🔒 Private bot.")
         return
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Start / Menu
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Start / Menu ─────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     if not private_guard(m):
@@ -305,11 +292,7 @@ async def cmd_start(m: Message):
     u = await get_user(m.from_user.id)
     await m.answer("Menu", reply_markup=main_menu_kb(u))
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Menu: Profile / Health / Logs / Support
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Profile / Health / Logs / Support ─────────────────────────
 @dp.callback_query(F.data == "menu:profile")
 async def menu_profile(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
@@ -342,7 +325,7 @@ async def menu_support(cq: types.CallbackQuery):
 @dp.callback_query(F.data == "menu:health")
 async def menu_health(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
-    ok_db = "✅"  # if we reached here, db works
+    ok_db = "✅"
     ok_notifier = "✅" if u.get("notifier_id") else "❌"
     txt = (
         "🩺 <b>Health</b>\n"
@@ -369,16 +352,15 @@ async def menu_logs(cq: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton("⬅️ Back", callback_data="back:main")]]
     ))
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Settings
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Settings ─────────────────────────
 @dp.callback_query(F.data == "menu:settings")
 async def menu_settings(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
     txt, kb = settings_view(u)
     await cq.message.edit_text(txt, reply_markup=kb)
+
+class FieldNames(StatesGroup):
+    pass
 
 ENTRY_MAP = {
     "set:cycles":  ("Send number of cycles (0 = ∞).", "cycles"),
@@ -415,11 +397,7 @@ async def set_field(m: Message, state: FSMContext):
     txt, kb = settings_view(u)
     await m.answer("✅ Saved.\n\n" + txt, reply_markup=kb)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Catalog
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Catalog ─────────────────────────
 @dp.callback_query(F.data == "menu:catalog")
 async def catalog_root(cq: types.CallbackQuery):
     title, kb = catalog_list_kb(0)
@@ -437,22 +415,15 @@ async def catalog_detail(cq: types.CallbackQuery):
     header, kb = catalog_detail_kb(gid)
     await cq.message.edit_text(header, reply_markup=kb)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Buy (manual from catalog)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Manual Buy ─────────────────────────
 async def try_debit(uid: int, cost: int) -> tuple[bool, str]:
     u = await get_user(uid)
     if u["credit"] < cost:
         return False, "Insufficient credit."
-    # daily budget check
     if u.get("daily_budget", 0) and u.get("spent_today", 0) + cost > u["daily_budget"]:
         return False, "Daily budget exceeded."
-    # overall limit check
     if u.get("overall_limit", 0) and u["overall_limit"] < cost:
         return False, "Overall limit reached."
-    # debit
     u["credit"] -= cost
     u["spent_today"] += cost
     if u.get("overall_limit", 0):
@@ -461,37 +432,33 @@ async def try_debit(uid: int, cost: int) -> tuple[bool, str]:
     return True, "OK"
 
 async def send_fake_gift(chat_id: int, emoji: str, name: str, total_cost: int, qty: int, mode: str):
-    # This is a visual confirmation message. If you have a real “gift send” API, call it here.
     caption = f"<b>Gift from Dream</b>\nMode: <i>{mode}</i>\n{emoji} {name} × <b>{qty}</b>\nSpent: <b>{total_cost}⭐</b>"
     await bot.send_message(chat_id, caption)
 
-@dp.callback_query(F.data.startswith("buy:"))
+@dp.callback_query(F.data.startswith("buy:")))
 async def on_buy(cq: types.CallbackQuery):
+    # data: buy:<gid>:<count>
     _, gid, count_s = cq.data.split(":")
     count = int(count_s)
     g = next(x for x in CATALOG if x["id"] == gid)
     cost = g["price"] * count
-
     ok, reason = await try_debit(cq.from_user.id, cost)
     if not ok:
         await cq.answer(reason, show_alert=True)
         return
-
     await db_log(cq.from_user.id, "BUY", f"{g['name']}×{count} cost={cost}")
     await send_fake_gift(cq.from_user.id, g["emoji"], g["name"], cost, count, "Manual")
     await cq.answer("Purchased ✅", show_alert=False)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Deposit (Stars) + custom amount guard
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Deposit (Stars) ─────────────────────────
+def deposit_menu_kb() -> InlineKeyboardMarkup:
+    return deposit_kb()
 
 @dp.callback_query(F.data == "menu:deposit")
 async def menu_deposit(cq: types.CallbackQuery):
-    await cq.message.edit_text("Top up Stars", reply_markup=deposit_kb())
+    await cq.message.edit_text("Top up Stars", reply_markup=deposit_menu_kb())
 
 async def send_invoice(chat_id: int, amount: int):
-    # Stars invoice (currency XTR). No provider_token needed for Stars.
     title = "Top up Stars"
     desc = f"Add {amount}⭐ to bot balance"
     payload = json.dumps({"kind": "deposit", "amount": amount})
@@ -511,12 +478,12 @@ async def send_invoice(chat_id: int, amount: int):
     )
 
 @dp.pre_checkout_query()
-async def on_pre_checkout(pcq: types.PreCheckoutQuery):
+async def on_pre_checkout(pcq: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pcq.id, ok=True)
 
 @dp.message(F.successful_payment)
 async def on_paid(m: Message):
-    total = m.successful_payment.total_amount  # for XTR it's stars
+    total = m.successful_payment.total_amount  # for Stars (XTR), this is the stars count
     u = await get_user(m.from_user.id)
     u["credit"] += total
     await db_save_user(m.from_user.id, u)
@@ -548,11 +515,7 @@ async def dep_custom(m: Message, state: FSMContext):
     await state.clear()
     await send_invoice(m.chat.id, amt)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Refunds / Credits (internal)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Refunds / Credits (internal) ─────────────────────────
 @dp.callback_query(F.data == "menu:refunds")
 async def refunds_menu(cq: types.CallbackQuery):
     txt = "Refunds / Credits — internal only (Telegram Stars are final)."
@@ -564,14 +527,9 @@ async def refunds_menu(cq: types.CallbackQuery):
 
 @dp.callback_query(F.data == "credit:refund_last")
 async def do_refund(cq: types.CallbackQuery):
-    # Simplified: just log and tell nothing to refund (unless you store purchases)
     await cq.answer("Nothing to refund", show_alert=True)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-Buy toggle
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Auto-Buy toggle ─────────────────────────
 @dp.callback_query(F.data == "auto:toggle")
 async def toggle_auto(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
@@ -581,15 +539,10 @@ async def toggle_auto(cq: types.CallbackQuery):
     await cq.message.edit_reply_markup(reply_markup=main_menu_kb(u))
     await cq.answer("Auto-Buy is now " + ("ON" if new_flag else "OFF"))
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Notifier channel connect + listener
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Notifier channel connect + listener ─────────────────────────
 @dp.message(Command("source"))
 async def cmd_source(m: Message):
-    if not private_guard(m):
-        return
+    if not private_guard(m): return
     parts = (m.text or "").split()
     if len(parts) != 2:
         await m.answer("Send: <code>/source -1001234567890</code>")
@@ -608,20 +561,14 @@ async def cmd_source(m: Message):
 
 @dp.channel_post()
 async def on_channel_post(m: Message):
-    # Minimal heuristic: when a message in the notifier mentions "limited gift" / "drop"
     text = (m.text or m.caption or "").lower()
-    if "limited" in text and "gift" in text:
-        # Fire for every admin user that has this channel configured
+    if ("limited" in text and "gift" in text) or ("drop" in text and "gift" in text):
         for uid in await db_all_users():
             u = await get_user(uid)
             if u.get("auto_on") and u.get("notifier_id") == m.chat.id:
                 await try_auto_buy(uid)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Test Event
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Test Event ─────────────────────────
 @dp.callback_query(F.data == "menu:test")
 async def menu_test(cq: types.CallbackQuery):
     n = len(CATALOG)
@@ -638,20 +585,13 @@ async def test_notify(cq: types.CallbackQuery):
     await cq.message.answer("🚨 Limited gift detected (test) — will try to buy if Auto-Buy is ON.")
     await try_auto_buy(cq.from_user.id)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-buy engine (simple & fast)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Auto-buy engine ─────────────────────────
 def first_allowed_gift(u: dict):
-    """Pick the first gift matching price limits."""
     low = u.get("lower_limit", 0) or 0
     up  = u.get("upper_limit", 0) or 0
     for g in CATALOG:
-        if (low and g["price"] < low): 
-            continue
-        if (up and g["price"] > up): 
-            continue
+        if low and g["price"] < low: continue
+        if up  and g["price"] > up:  continue
         return g
     return None
 
@@ -660,68 +600,56 @@ async def try_auto_buy(uid: int):
     if not u.get("auto_on"):
         await db_log(uid, "AUTO", "Skipped (auto off)")
         return
-
     g = first_allowed_gift(u)
     if not g:
         await db_log(uid, "AUTO", "No gift matches price filters")
         return
-
-    # supply/overall/daily checks
     cycles = u.get("cycles", 1)
-    qty = 1 if cycles == 1 else min(1, cycles)  # buy 1 per trigger (risky to loop hard)
-    if u.get("supply_limit", 0) and qty > u["supply_limit"]:
-        qty = u["supply_limit"]
+    qty = max(1, min(cycles, u.get("supply_limit", cycles) or cycles))
+    # Conservative: buy 1 per trigger to stay safe (avoid accidental burn)
+    qty = 1 if qty <= 0 else 1
     total = g["price"] * qty
-
     ok, reason = await try_debit(uid, total)
     if not ok:
         await db_log(uid, "AUTO", f"Fail: {reason}")
         return
-
     await db_log(uid, "AUTO", f"Bought {g['name']}×{qty} cost={total}")
     await send_fake_gift(uid, g["emoji"], g["name"], total, qty, "Auto")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Deposit menu entry point
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Back to main ─────────────────────────
 @dp.callback_query(F.data == "back:main")
 async def back_main(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
     await cq.message.edit_text("Menu", reply_markup=main_menu_kb(u))
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Commands: /menu, /deposit, /support
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────────────────── Commands: /menu /deposit /support ─────────────────────────
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
-    if not private_guard(m):
-        await m.answer("🔒 Private bot.")
-        return
+    if not private_guard(m): 
+        await m.answer("🔒 Private bot."); return
     u = await get_user(m.from_user.id)
     await m.answer("Menu", reply_markup=main_menu_kb(u))
 
 @dp.message(Command("deposit"))
 async def cmd_deposit(m: Message):
-    if not private_guard(m):
-        return
+    if not private_guard(m): return
     await m.answer("Top up Stars", reply_markup=deposit_kb())
 
 @dp.message(Command("support"))
 async def cmd_support(m: Message):
     await m.answer("🆘 Support: @safoneapi")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Startup
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Startup ─────────────────────────
+async def notify_channels_startup():
+    for ch_id in await db_all_notifier_ids():
+        try:
+            await bot.send_message(ch_id, "✅ Dream bot is online and watching this channel.")
+        except Exception as e:
+            log.warning("Notify failed for %s: %s", ch_id, e)
 
 async def main():
     await init_db()
-    log.info("DB ready at %s", DB_PATH)
+    await notify_channels_startup()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
