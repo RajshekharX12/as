@@ -20,14 +20,31 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
-# ───────────────────────── EDIT THIS ─────────────────────────
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"     # ← put your bot token
-ADMINS = {7940894807, 5770074932}           # allowed users
-DB_PATH = "./autobuy.sqlite3"               # sqlite file
+# ───────── EDIT ONLY THIS VALUE ─────────
+RAW_BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"   # ← your token here (just the token)
+ADMINS = {7940894807, 5770074932}             # allowed users (private bot)
+DB_PATH = "./autobuy.sqlite3"
 PRICE_MIN_DEFAULT = 100
 PRICE_MAX_DEFAULT = 1000
-MIN_XTR, MAX_XTR = 15, 200000               # Stars invoice bounds
-# ─────────────────────────────────────────────────────────────
+MIN_XTR, MAX_XTR = 15, 200000                 # Stars invoice bounds
+# ────────────────────────────────────────
+
+def _sanitize_token(s: str) -> str:
+    s = (s or "").strip()
+    # strip zero-width & smart quotes and spaces
+    for ch in ["\u200b", "\u200c", "\u200d", "“", "”", "‘", "’", " "]:
+        s = s.replace(ch, "")
+    # strip surrounding quotes/backticks if pasted
+    if len(s) > 2 and s[0] in "'\"`" and s[-1] in "'\"`":
+        s = s[1:-1]
+    return s
+
+BOT_TOKEN = _sanitize_token(RAW_BOT_TOKEN)
+if not re.match(r"^\d{5,}:[\w-]{30,}$", BOT_TOKEN):
+    raise SystemExit(
+        f"BOT_TOKEN looks malformed (len={len(BOT_TOKEN)}). "
+        "It must look like 123456789:AA... Re-copy from @BotFather and paste plain."
+    )
 
 E = dict(bolt="⚡", ok="✅", bad="❌", gear="⚙️", gift="🎁",
          profile="🧑‍💼", deposit="⭐", logs="📄", health="🩺",
@@ -45,7 +62,7 @@ def db():
     return aiosqlite.connect(DB_PATH)
 
 async def init_db():
-    # NOTE: SQLite doesn't allow ? placeholders in DDL, so we inline defaults.
+    # NOTE: SQLite doesn't allow ? placeholders in DDL; defaults are literals.
     async with db() as con:
         await con.execute(f"""
             CREATE TABLE IF NOT EXISTS users(
@@ -101,7 +118,7 @@ async def db_get_user(uid: int) -> Optional[dict]:
         return dict(zip(cols, row))
 
 async def db_save_user(uid: int, u: dict):
-    fields = [k for k in DEFAULT_USER.keys()]
+    fields = list(DEFAULT_USER.keys())
     placeholders = ",".join(f"{k}=?" for k in fields)
     values = [u[k] for k in fields]
     async with db() as con:
@@ -234,7 +251,7 @@ async def debit_once(uid: int, price: int) -> Tuple[bool, str]:
     return True, "OK"
 
 async def autobuy(uid: int, price: int, source: str):
-    """Buy as many items of `price` as possible within range/budget/credit."""
+    """Greedy: buy as many items of `price` as possible within range/budget/credit."""
     u = await get_user(uid)
     if not u.get("auto_on"):
         await db_log(uid, "AUTO", "off"); return
@@ -357,7 +374,7 @@ async def set_daily_value(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Saved.", reply_markup=kb_settings())
 
-# Money
+# Money (deposit / balance / refund)
 @dp.callback_query(F.data == "menu:money")
 async def menu_money(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
@@ -455,10 +472,8 @@ async def connect_prompt(cq: types.CallbackQuery, state: FSMContext):
 @dp.message(Entry.wait_channel_forward)
 async def on_forward(m: Message, state: FSMContext):
     ch_obj = None
-    # Legacy field, if present:
-    if hasattr(m, "forward_from_chat") and m.forward_from_chat:
+    if getattr(m, "forward_from_chat", None):
         ch_obj = m.forward_from_chat
-    # Bot API ≥7: forward_origin may hold channel info
     if ch_obj is None and getattr(m, "forward_origin", None):
         fo = m.forward_origin
         for attr in ("chat", "sender_chat", "from_chat"):
@@ -467,7 +482,6 @@ async def on_forward(m: Message, state: FSMContext):
                 break
     if not ch_obj or not getattr(ch_obj, "id", None):
         await m.answer("That wasn’t a forwarded channel post. Try again."); return
-
     ch_id = ch_obj.id
     await set_user(m.from_user.id, notifier_id=ch_id)
     try:
@@ -556,7 +570,7 @@ async def on_channel_post(msg: Message):
 # ───────────────────────── Run ─────────────────────────
 async def main():
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit("Set BOT_TOKEN at top of bot.py")
+        raise SystemExit("Set RAW_BOT_TOKEN at top of bot.py")
     await init_db()
     await dp.start_polling(bot)
 
