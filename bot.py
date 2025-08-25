@@ -17,7 +17,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-# ------------- Config -------------
+# ───────────────────────── Config ─────────────────────────
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -27,16 +27,19 @@ HARDCODE_ADMINS = {7940894807, 5770074932}
 ENV_ADMINS = {int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x}
 ADMINS = HARDCODE_ADMINS | ENV_ADMINS
 
-NOTIFIER_CHANNEL_ID = os.getenv("NOTIFIER_CHANNEL_ID")  # optional string
+NOTIFIER_CHANNEL_ID = os.getenv("NOTIFIER_CHANNEL_ID")  # "-100..." or empty to disable
 
 DB_PATH = "bot.db"
-CURRENCY_XTR = "XTR"
+CURRENCY_XTR = "XTR"  # Telegram Stars currency
 
-# 💝 only
-GIFT_NAME = "💝 Gift"
-GIFT_PRICE = 15  # ⭐ per unit
-PACKS: List[int] = [1, 2, 3, 5, 10, 20, 30, 50, 75, 100]  # grid packs
+# Default gift fallback (used until we detect a live limited gift from the channel)
+DEFAULT_GIFT_TITLE = "💝 Gift"
+DEFAULT_GIFT_PRICE = 15  # ⭐ per unit
 
+# Grid packs for catalog
+PACKS: List[int] = [1, 2, 3, 5, 10, 20, 30, 50, 75, 100]
+
+# Stars top-up rules
 TOPUP_PRESETS = [50, 1000, 3000]
 CUSTOM_MIN, CUSTOM_MAX = 15, 200_000
 
@@ -48,16 +51,16 @@ E = dict(
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
-log = logging.getLogger("dream-bot")
+log = logging.getLogger("auto-gifts")
 
-# ------------- Simple state (no FSM lib needed) -------------
+# ─────────────────────── In-memory waits ───────────────────────
 WAIT = {}  # dict[user_id] -> {"key": True}
 def set_wait(uid: int, key: str): WAIT.setdefault(uid, {})[key] = True
 def pop_wait(uid: int, key: str) -> bool: return bool(WAIT.get(uid, {}).pop(key, None))
 def is_wait(uid: int, key: str) -> bool: return bool(WAIT.get(uid, {}).get(key))
 
-# ------------- DB -------------
-CREATE_SCHEMA = """
+# ───────────────────────── Database ─────────────────────────
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
   user_id INTEGER PRIMARY KEY,
   internal_credit INTEGER NOT NULL DEFAULT 0,
@@ -65,7 +68,7 @@ CREATE TABLE IF NOT EXISTS users (
   auto_on INTEGER NOT NULL DEFAULT 0,
   notify_on INTEGER NOT NULL DEFAULT 1,
   cycles INTEGER NOT NULL DEFAULT 1,
-  daily_budget INTEGER,
+  daily_budget INTEGER,           -- NULL = infinite
   spent_today INTEGER NOT NULL DEFAULT 0,
   last_spent_day INTEGER NOT NULL DEFAULT 0
 );
@@ -85,13 +88,16 @@ CREATE TABLE IF NOT EXISTS logs (
   detail TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
-async def open_db():
-    db = await aiosqlite.connect(DB_PATH)
-    await db.executescript(CREATE_SCHEMA)
-    await db.commit()
-    return db
+async def ensure_schema():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
 
 @dataclass
 class User:
@@ -105,49 +111,125 @@ class User:
     spent_today: int = 0
     last_spent_day: int = 0  # yyyyMMdd
 
-async def ensure_user(db, uid: int) -> User:
-    cur = await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    row = await cur.fetchone()
-    if not row:
-        await db.execute("INSERT INTO users(user_id) VALUES(?)", (uid,))
+def today_key() -> int: return int(time.strftime("%Y%m%d"))
+
+async def ensure_user(uid: int) -> User:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO users(user_id) VALUES(?)", (uid,))
+            await db.commit()
+            return User(user_id=uid)
+        return User(
+            user_id=row[0], internal_credit=row[1], bot_stars=row[2],
+            auto_on=bool(row[3]), notify_on=bool(row[4]), cycles=row[5],
+            daily_budget=row[6], spent_today=row[7], last_spent_day=row[8]
+        )
+
+async def save_user(u: User):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE users SET internal_credit=?, bot_stars=?, auto_on=?, notify_on=?,
+               cycles=?, daily_budget=?, spent_today=?, last_spent_day=? WHERE user_id=?""",
+            (u.internal_credit, u.bot_stars, int(u.auto_on), int(u.notify_on),
+             u.cycles, u.daily_budget, u.spent_today, u.last_spent_day, u.user_id)
+        )
         await db.commit()
-        return User(user_id=uid)
-    return User(
-        user_id=row[0], internal_credit=row[1], bot_stars=row[2],
-        auto_on=bool(row[3]), notify_on=bool(row[4]), cycles=row[5],
-        daily_budget=row[6], spent_today=row[7], last_spent_day=row[8]
-    )
 
-async def save_user(db, u: User):
-    await db.execute(
-        """UPDATE users SET internal_credit=?, bot_stars=?, auto_on=?, notify_on=?,
-           cycles=?, daily_budget=?, spent_today=?, last_spent_day=? WHERE user_id=?""",
-        (u.internal_credit, u.bot_stars, int(u.auto_on), int(u.notify_on),
-         u.cycles, u.daily_budget, u.spent_today, u.last_spent_day, u.user_id)
-    )
-    await db.commit()
+async def add_log(user_id: Optional[int], event: str, detail: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO logs(user_id, event, detail, created_at) VALUES(?,?,?,?)",
+            (user_id, event, detail, int(time.time()))
+        )
+        await db.commit()
 
-async def add_log(db, user_id: Optional[int], event: str, detail: str = ""):
-    await db.execute(
-        "INSERT INTO logs(user_id, event, detail, created_at) VALUES(?,?,?,?)",
-        (user_id, event, detail, int(time.time()))
-    )
-    await db.commit()
+async def recent_logs(limit=20):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT event, detail, created_at FROM logs ORDER BY id DESC LIMIT ?", (limit,))
+        return await cur.fetchall()
 
-async def credit_of(db, uid: int) -> int:
-    cur = await db.execute("SELECT internal_credit FROM users WHERE user_id=?", (uid,))
-    row = await cur.fetchone()
-    return int(row[0]) if row else 0
+async def credit_of(uid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT internal_credit FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
-async def adjust_credit(db, uid: int, delta: int):
-    await db.execute("UPDATE users SET internal_credit = internal_credit + ? WHERE user_id=?", (delta, uid))
-    await db.commit()
+async def adjust_credit(uid: int, delta: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET internal_credit = internal_credit + ? WHERE user_id=?", (delta, uid))
+        await db.commit()
 
-async def recent_logs(db, limit=20):
-    cur = await db.execute("SELECT event, detail, created_at FROM logs ORDER BY id DESC LIMIT ?", (limit,))
-    return await cur.fetchall()
+async def kv_set(key: str, value: dict):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, json.dumps(value)))
+        await db.commit()
 
-# ------------- Bot -------------
+async def kv_get(key: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM kv WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return json.loads(row[0]) if row else None
+
+# ─────────────────────── Gift helpers ───────────────────────
+def parse_price_from_text(s: str) -> Optional[int]:
+    s = s.lower()
+    m = re.search(r"(\d{1,6})\s*(stars|star|⭐)", s)
+    return int(m.group(1)) if m else None
+
+async def set_current_gift(title: str, price: int):
+    await kv_set("current_gift", {"title": title, "price": price, "ts": int(time.time())})
+
+async def get_current_gift() -> Tuple[str, int]:
+    cg = await kv_get("current_gift")
+    if cg and isinstance(cg, dict):
+        return str(cg.get("title", DEFAULT_GIFT_TITLE)), int(cg.get("price", DEFAULT_GIFT_PRICE))
+    return DEFAULT_GIFT_TITLE, DEFAULT_GIFT_PRICE
+
+# Raw call to Bot API sendGift (if the method is unavailable for your bot, we show the error)
+async def send_gift_once(bot: Bot, to_user_id: int, stars: int, reason: str) -> Tuple[bool, str]:
+    payload = {"chat_id": to_user_id, "gift": json.dumps({"star_count": stars}), "text": f"{reason}"}
+    try:
+        res = await bot.request("sendGift", payload)
+        return bool(res), "OK"
+    except Exception as e:
+        return False, str(e)
+
+def within_budget(u: User, price: int) -> Tuple[bool, str]:
+    d = today_key()
+    if u.last_spent_day != d:
+        u.last_spent_day, u.spent_today = d, 0
+    if u.daily_budget is None:
+        return True, ""
+    if u.spent_today + price <= u.daily_budget:
+        return True, ""
+    return False, f"Daily budget exceeded ({u.spent_today}⭐/{u.daily_budget}⭐)."
+
+async def buy_units(bot: Bot, u: User, unit_price: int, units: int, mode: str) -> Tuple[int, str]:
+    total = units * unit_price
+    bal = await credit_of(u.user_id)
+    if bal < total:
+        return 0, f"Not enough credit ({bal}⭐ < {total}⭐)."
+    ok_budget, why = within_budget(u, total)
+    if not ok_budget:
+        return 0, why
+    sent = 0
+    for _ in range(units):
+        ok, detail = await send_gift_once(bot, u.user_id, unit_price, f"{mode}")
+        if not ok:
+            await add_log(u.user_id, f"{mode}_FAIL", detail)
+            return sent, f"Stopped: {detail}"
+        sent += 1
+        u.spent_today += unit_price
+        await asyncio.sleep(0.12)  # small spacing for reliability
+    await adjust_credit(u.user_id, -total)
+    await save_user(u)
+    await add_log(u.user_id, f"{mode}_OK", f"{units}× {unit_price}⭐ (total {total}⭐)")
+    return sent, "OK"
+
+# ─────────────────────── Bot / UI ───────────────────────
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -155,7 +237,6 @@ dp.include_router(router)
 
 def is_admin(uid: int) -> bool: return uid in ADMINS
 
-# ------------- Keyboards -------------
 def main_menu_kb(auto: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=f"{E['bolt']} Auto-Buy: {'ON '+E['ok'] if auto else 'OFF '+E['bad']}", callback_data="auto:toggle"),
@@ -180,16 +261,17 @@ def deposit_kb() -> InlineKeyboardMarkup:
     b.adjust(3, 1, 1)
     return b.as_markup()
 
-def catalog_text(page: int) -> str:
-    return f"{E['gift']} Gift Catalog page {page+1}/{(len(PACKS)+5)//6} ({GIFT_NAME})"
+def catalog_text(title: str, price: int, page: int) -> str:
+    pages = (len(PACKS) + 5) // 6
+    return f"{E['gift']} Catalog {page+1}/{pages} — {title} ({price}⭐ each)"
 
-def catalog_kb(page: int) -> InlineKeyboardMarkup:
+def catalog_kb(price: int, page: int) -> InlineKeyboardMarkup:
     page = max(0, min(page, (len(PACKS)-1)//6))
     start = page * 6
     items = PACKS[start:start+6]
     b = InlineKeyboardBuilder()
     for cnt in items:
-        total = cnt * GIFT_PRICE
+        total = cnt * price
         b.button(text=f"{cnt}× for {total}⭐", callback_data=f"buy-pack:{cnt}")
     b.adjust(2, 2, 2)
     nav = []
@@ -202,7 +284,7 @@ def catalog_kb(page: int) -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="Back", callback_data="menu:back"))
     return b.as_markup()
 
-def settings_kb(u) -> InlineKeyboardMarkup:
+def settings_kb(u: User) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="Cycles", callback_data="set:cycles")
     b.button(text="Daily budget", callback_data="set:budget")
@@ -219,107 +301,58 @@ def refunds_kb() -> InlineKeyboardMarkup:
     b.adjust(1, 1, 1, 1)
     return b.as_markup()
 
-def test_event_kb() -> InlineKeyboardMarkup:
+def test_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="Simulate drop (notify)", callback_data="test:notify")
     b.button(text="Back", callback_data="menu:back")
     b.adjust(1, 1)
     return b.as_markup()
 
-# ------------- Helpers -------------
-def today_key() -> int: return int(time.strftime("%Y%m%d"))
-
-def within_budget(u: User, price: int) -> Tuple[bool, str]:
-    d = today_key()
-    if u.last_spent_day != d:
-        u.last_spent_day, u.spent_today = d, 0
-    if u.daily_budget is None: return True, ""
-    if u.spent_today + price <= u.daily_budget: return True, ""
-    return False, f"Daily budget exceeded ({u.spent_today}⭐/{u.daily_budget}⭐)."
-
-async def send_menu(target: Message | CallbackQuery, u: User):
+async def show_menu(target: Message | CallbackQuery, u: User):
     kb = main_menu_kb(u.auto_on)
     if isinstance(target, Message):
         await target.answer("Menu", reply_markup=kb)
     else:
         await target.message.edit_text("Menu", reply_markup=kb)
 
-async def send_gift_once(to_user_id: int, stars: int, reason: str) -> Tuple[bool, str]:
-    payload = {"chat_id": to_user_id, "gift": json.dumps({"star_count": stars}), "text": f"{GIFT_NAME}\n{reason}"}
-    try:
-        res = await bot.request("sendGift", payload)
-        return bool(res), "OK"
-    except Exception as e:
-        return False, str(e)
-
-async def buy_units(db, u: User, units: int, mode: str) -> Tuple[int, str]:
-    total = units * GIFT_PRICE
-    bal = await credit_of(db, u.user_id)
-    if bal < total:
-        return 0, f"Not enough credit ({bal}⭐ < {total}⭐)."
-    ok_budget, why = within_budget(u, total)
-    if not ok_budget:
-        return 0, why
-
-    sent = 0
-    # fire fast but not crazy to avoid rate limits
-    for _ in range(units):
-        ok, detail = await send_gift_once(u.user_id, GIFT_PRICE, mode)
-        if not ok:
-            await add_log(db, u.user_id, f"{mode}_FAIL", detail)
-            return sent, f"Stopped: {detail}"
-        sent += 1
-        u.spent_today += GIFT_PRICE
-        await asyncio.sleep(0.15)  # tiny spacing for reliability
-
-    await adjust_credit(db, u.user_id, -total)
-    await save_user(db, u)
-    await add_log(db, u.user_id, f"{mode}_OK", f"{units}× {GIFT_PRICE}⭐ (total {total}⭐)")
-    return sent, "OK"
-
-def parse_price_from_text(s: str) -> Optional[int]:
-    s = s.lower()
-    # matches "for 50 stars", "— 15⭐", "15 star"
-    m = re.search(r"(\d{1,6})\s*(stars|star|⭐)", s)
-    return int(m.group(1)) if m else None
-
-# ------------- Handlers -------------
+# ─────────────────────── Handlers ───────────────────────
 @router.message(CommandStart())
 async def start(m: Message):
     if not is_admin(m.from_user.id):
         await m.answer(f"{E['lock']} Private bot.")
         return
-    async with await open_db() as db:
-        u = await ensure_user(db, m.from_user.id)
-        await send_menu(m, u)
+    u = await ensure_user(m.from_user.id)
+    await show_menu(m, u)
 
 @router.callback_query(F.data == "menu:back")
 async def cb_back(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         await c.answer("Private bot.", show_alert=True)
         return
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
-        await send_menu(c, u)
+    u = await ensure_user(c.from_user.id)
+    await show_menu(c, u)
 
+# Profile
 @router.callback_query(F.data == "menu:profile")
 async def cb_profile(c: CallbackQuery):
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
-        txt = (f"{E['profile']} Profile\n"
-               f"{E['wallet']} Internal credit: {u.internal_credit}⭐\n"
-               f"🤖 Bot Stars: {u.bot_stars}⭐\n\n"
-               f"{E['recycle']} Auto-Purchase\n"
-               f"— Cycles: {u.cycles}\n"
-               f"— Daily budget: {('∞' if u.daily_budget is None else str(u.daily_budget))}⭐ "
-               f"(spent today: {u.spent_today}⭐)\n"
-               f"{E['bolt']} Auto: {'on' if u.auto_on else 'off'}")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Refunds / Credits", callback_data="menu:refunds")],
-            [InlineKeyboardButton(text="Back", callback_data="menu:back")]
-        ])
-        await c.message.edit_text(txt, reply_markup=kb)
+    u = await ensure_user(c.from_user.id)
+    title, price = await get_current_gift()
+    txt = (f"{E['profile']} Profile\n"
+           f"{E['wallet']} Internal credit: {u.internal_credit}⭐\n"
+           f"🤖 Bot Stars: {u.bot_stars}⭐\n\n"
+           f"{E['recycle']} Auto-Purchase\n"
+           f"— Cycles: {u.cycles}\n"
+           f"— Daily budget: {('∞' if u.daily_budget is None else str(u.daily_budget))}⭐ "
+           f"(spent today: {u.spent_today}⭐)\n"
+           f"Current gift: {title} ({price}⭐)\n"
+           f"{E['bolt']} Auto: {'on' if u.auto_on else 'off'}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Refunds / Credits", callback_data="menu:refunds")],
+        [InlineKeyboardButton(text="Back", callback_data="menu:back")]
+    ])
+    await c.message.edit_text(txt, reply_markup=kb)
 
+# Deposit
 @router.callback_query(F.data == "menu:deposit")
 async def cb_deposit(c: CallbackQuery):
     await c.message.edit_text("Top up Stars", reply_markup=deposit_kb())
@@ -334,7 +367,19 @@ async def cb_deposit_buttons(c: CallbackQuery):
             reply_markup=back_kb()
         )
         return
-    await create_invoice(c.message, c.from_user.id, int(kind))
+    amount = int(kind)
+    await create_invoice(c.message, c.from_user.id, amount)
+
+@router.message(F.text.regexp(r"^\d+$"))
+async def custom_amount(m: Message):
+    if not is_wait(m.from_user.id, "custom"):
+        return
+    pop_wait(m.from_user.id, "custom")
+    amount = int(m.text)
+    if amount < CUSTOM_MIN or amount > CUSTOM_MAX:
+        await m.answer(f"Amount must be between {CUSTOM_MIN} and {CUSTOM_MAX} Stars.", reply_markup=back_kb())
+        return
+    await create_invoice(m, m.from_user.id, amount)
 
 async def create_invoice(msg: Message, uid: int, amount: int):
     try:
@@ -357,30 +402,30 @@ async def on_pre_checkout(pcq: PreCheckoutQuery):
 async def on_payment(m: Message):
     sp = m.successful_payment
     stars = sp.total_amount
-    async with await open_db() as db:
-        await adjust_credit(db, m.from_user.id, stars)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await adjust_credit(m.from_user.id, stars)
         await db.execute(
             "INSERT INTO payments(user_id, stars, payload, charge_id, created_at, ok) VALUES(?,?,?,?,?,1)",
             (m.from_user.id, stars, sp.invoice_payload, sp.provider_payment_charge_id or "", int(time.time()))
         )
         await db.commit()
-        await add_log(db, m.from_user.id, "TOPUP", f"+{stars}⭐ payload={sp.invoice_payload}")
-        bal = await credit_of(db, m.from_user.id)
+    bal = await credit_of(m.from_user.id)
+    await add_log(m.from_user.id, "TOPUP", f"+{stars}⭐ payload={sp.invoice_payload}")
     await m.answer(f"Received {stars}⭐. Internal credit: {bal}⭐.")
 
+# Auto toggle
 @router.callback_query(F.data == "auto:toggle")
 async def cb_auto_toggle(c: CallbackQuery):
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
-        u.auto_on = not u.auto_on
-        await save_user(db, u)
-        await add_log(db, u.user_id, "AUTO", "ON" if u.auto_on else "OFF")
-        await c.message.edit_text("Menu", reply_markup=main_menu_kb(u.auto_on))
+    u = await ensure_user(c.from_user.id)
+    u.auto_on = not u.auto_on
+    await save_user(u)
+    await add_log(u.user_id, "AUTO", "ON" if u.auto_on else "OFF")
+    await c.message.edit_text("Menu", reply_markup=main_menu_kb(u.auto_on))
 
+# Health / Logs
 @router.callback_query(F.data == "menu:health")
 async def cb_health(c: CallbackQuery):
-    async with await open_db() as db:
-        rows = await recent_logs(db, 6)
+    rows = await recent_logs(6)
     lines = [f"{E['health']} Health", "DB: OK", "Threads: 1 (background)"]
     if NOTIFIER_CHANNEL_ID:
         lines.append(f"Notifier: listening to channel {NOTIFIER_CHANNEL_ID}")
@@ -393,17 +438,16 @@ async def cb_health(c: CallbackQuery):
 
 @router.callback_query(F.data == "menu:logs")
 async def cb_logs(c: CallbackQuery):
-    async with await open_db() as db:
-        rows = await recent_logs(db, 20)
+    rows = await recent_logs(20)
     if not rows:
         await c.message.edit_text("No logs yet.", reply_markup=back_kb()); return
     text = f"{E['logs']} Logs (latest):\n" + "\n".join(f"• {e} — {d}" for e, d, _ in rows)
     await c.message.edit_text(text[:4000], reply_markup=back_kb())
 
+# Settings
 @router.callback_query(F.data == "menu:settings")
 async def cb_settings(c: CallbackQuery):
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
+    u = await ensure_user(c.from_user.id)
     txt = (f"{E['gear']} Auto-Purchase Settings\n"
            f"Cycles: {u.cycles}\n"
            f"Daily budget: {('∞' if u.daily_budget is None else str(u.daily_budget))}⭐")
@@ -419,22 +463,77 @@ async def cb_set_budget(c: CallbackQuery):
     set_wait(c.from_user.id, "budget")
     await c.message.edit_text("Send daily budget in ⭐ (or 'inf').", reply_markup=back_kb())
 
+@router.message(F.text)
+async def on_text_waits(m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        return
+    # cycles
+    if is_wait(uid, "cycles") and re.fullmatch(r"\d+", m.text or ""):
+        pop_wait(uid, "cycles")
+        val = max(0, int(m.text))
+        u = await ensure_user(uid)
+        u.cycles = val if val != 0 else 500_000_000
+        await save_user(u)
+        await m.answer("Cycles updated.", reply_markup=back_kb())
+        return
+    # budget
+    if is_wait(uid, "budget"):
+        pop_wait(uid, "budget")
+        if (m.text or "").lower().strip() in {"inf", "∞", "none"}:
+            new_budget = None
+        elif re.fullmatch(r"\d+", m.text or ""):
+            new_budget = max(1, int(m.text))
+        else:
+            await m.answer("Send a number or 'inf'.", reply_markup=back_kb()); return
+        u = await ensure_user(uid)
+        u.daily_budget = new_budget
+        await save_user(u)
+        await m.answer("Budget updated.", reply_markup=back_kb())
+        return
+    # refund by TxID
+    if is_wait(uid, "refundtx"):
+        pop_wait(uid, "refundtx")
+        if not re.fullmatch(r"\d+", (m.text or "").strip()):
+            await m.answer("TxID must be a number.", reply_markup=back_kb()); return
+        txid = int(m.text.strip())
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, stars FROM payments WHERE id=?", (txid,))
+            row = await cur.fetchone()
+            if not row:
+                await m.answer("Tx not found.", reply_markup=back_kb()); return
+            _, stars = row
+            await adjust_credit(uid, -stars)
+            await db.execute("DELETE FROM payments WHERE id=?", (txid,))
+            await db.commit()
+        await m.answer(f"Credited {stars}⭐ back.", reply_markup=back_kb())
+        return
+    # add manual credit
+    if is_wait(uid, "addcredit") and re.fullmatch(r"\d+", m.text or ""):
+        pop_wait(uid, "addcredit")
+        amt = max(0, int(m.text))
+        await adjust_credit(uid, amt)
+        bal = await credit_of(uid)
+        await m.answer(f"Credit updated. Internal: {bal}⭐.", reply_markup=back_kb())
+        return
+
+# Refunds menu
 @router.callback_query(F.data == "menu:refunds")
 async def cb_refunds(c: CallbackQuery):
     await c.message.edit_text("Refunds / Credits — internal only (Telegram Stars are final).", reply_markup=refunds_kb())
 
 @router.callback_query(F.data == "refund:last")
 async def cb_refund_last(c: CallbackQuery):
-    async with await open_db() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id, stars FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 1", (c.from_user.id,))
         row = await cur.fetchone()
         if not row:
             await c.answer("Nothing to refund", show_alert=True); return
         pid, stars = row
-        await adjust_credit(db, c.from_user.id, -stars)
+        await adjust_credit(c.from_user.id, -stars)
         await db.execute("DELETE FROM payments WHERE id=?", (pid,))
         await db.commit()
-        bal = await credit_of(db, c.from_user.id)
+    bal = await credit_of(c.from_user.id)
     await c.message.answer(f"Credited {stars}⭐ back. Internal credit: {bal}⭐.", reply_markup=back_kb())
 
 @router.callback_query(F.data == "refund:tx")
@@ -447,116 +546,49 @@ async def cb_refund_add(c: CallbackQuery):
     set_wait(c.from_user.id, "addcredit")
     await c.message.edit_text("Send amount to add to internal credit.", reply_markup=back_kb())
 
-# One text handler to process all waits (prevents random numbers being treated as top-ups)
-@router.message(F.text)
-async def any_text(m: Message):
-    uid = m.from_user.id
-    if not is_admin(uid):
-        return
-
-    # custom top up (invoice)
-    if is_wait(uid, "custom") and re.fullmatch(r"\d+", m.text or ""):
-        pop_wait(uid, "custom")
-        amount = int(m.text)
-        if amount < CUSTOM_MIN or amount > CUSTOM_MAX:
-            await m.answer(f"Amount must be between {CUSTOM_MIN} and {CUSTOM_MAX} Stars.", reply_markup=back_kb())
-            return
-        await create_invoice(m, uid, amount)
-        return
-
-    # cycles
-    if is_wait(uid, "cycles") and re.fullmatch(r"\d+", m.text or ""):
-        pop_wait(uid, "cycles")
-        val = max(0, int(m.text))
-        async with await open_db() as db:
-            u = await ensure_user(db, uid)
-            u.cycles = val if val != 0 else 500_000_000
-            await save_user(db, u)
-        await m.answer("Cycles updated.", reply_markup=back_kb()); return
-
-    # budget
-    if is_wait(uid, "budget"):
-        pop_wait(uid, "budget")
-        new_budget: Optional[int]
-        if (m.text or "").lower().strip() in {"inf", "∞", "none"}:
-            new_budget = None
-        elif re.fullmatch(r"\d+", m.text or ""):
-            new_budget = max(1, int(m.text))
-        else:
-            await m.answer("Send a number or 'inf'.", reply_markup=back_kb()); return
-        async with await open_db() as db:
-            u = await ensure_user(db, uid)
-            u.daily_budget = new_budget
-            await save_user(db, u)
-        await m.answer("Budget updated.", reply_markup=back_kb()); return
-
-    # refund by tx
-    if is_wait(uid, "refundtx"):
-        pop_wait(uid, "refundtx")
-        txid_text = m.text.strip()
-        if not re.fullmatch(r"\d+", txid_text):
-            await m.answer("TxID must be a number.", reply_markup=back_kb()); return
-        txid = int(txid_text)
-        async with await open_db() as db:
-            cur = await db.execute("SELECT id, stars FROM payments WHERE id=?", (txid,))
-            row = await cur.fetchone()
-            if not row:
-                await m.answer("Tx not found.", reply_markup=back_kb()); return
-            _, stars = row
-            await adjust_credit(db, uid, -stars)
-            await db.execute("DELETE FROM payments WHERE id=?", (txid,))
-            await db.commit()
-        await m.answer(f"Credited {stars}⭐ back.", reply_markup=back_kb()); return
-
-    # add manual credit
-    if is_wait(uid, "addcredit") and re.fullmatch(r"\d+", m.text or ""):
-        pop_wait(uid, "addcredit")
-        amt = max(0, int(m.text))
-        async with await open_db() as db:
-            await adjust_credit(db, uid, amt)
-            bal = await credit_of(db, uid)
-        await m.answer(f"Credit updated. Internal: {bal}⭐.", reply_markup=back_kb())
-        return
-
+# Catalog
 @router.callback_query(F.data.startswith("menu:catalog:"))
 async def cb_catalog_page(c: CallbackQuery):
     page = int(c.data.split(":")[2])
-    await c.message.edit_text(catalog_text(page), reply_markup=catalog_kb(page))
+    title, price = await get_current_gift()
+    await c.message.edit_text(catalog_text(title, price, page), reply_markup=catalog_kb(price, page))
 
 @router.callback_query(F.data == "menu:catalog:0")
 async def cb_catalog_root(c: CallbackQuery):
-    await c.message.edit_text(catalog_text(0), reply_markup=catalog_kb(0))
+    title, price = await get_current_gift()
+    await c.message.edit_text(catalog_text(title, price, 0), reply_markup=catalog_kb(price, 0))
 
 @router.callback_query(F.data.startswith("buy-pack:"))
 async def cb_buy_pack(c: CallbackQuery):
     units = int(c.data.split(":")[1])
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
-        sent, info = await buy_units(db, u, units, "MANUAL")
-        if sent == 0:
-            await c.answer(info, show_alert=True)
-            return
-        bal = await credit_of(db, u.user_id)
-    await c.message.answer(f"{E['gift']} Sent {units}× {GIFT_PRICE}⭐ ({units*GIFT_PRICE}⭐). Balance: {bal}⭐.")
+    u = await ensure_user(c.from_user.id)
+    title, unit_price = await get_current_gift()
+    sent, info = await buy_units(bot, u, unit_price, units, "MANUAL")
+    if sent == 0:
+        await c.answer(info, show_alert=True)
+        return
+    bal = await credit_of(u.user_id)
+    await c.message.answer(f"{E['gift']} Sent {units}× {unit_price}⭐ ({units*unit_price}⭐). Balance: {bal}⭐.")
 
+# Test
 @router.callback_query(F.data == "menu:test")
 async def cb_test(c: CallbackQuery):
-    await c.message.edit_text("Test Event\n— Simulate a limited drop.", reply_markup=test_event_kb())
+    await c.message.edit_text("Test Event\n— Simulate a limited drop.", reply_markup=test_kb())
 
 @router.callback_query(F.data == "test:notify")
 async def cb_test_notify(c: CallbackQuery):
+    # simulate a 15⭐ drop
+    await set_current_gift(DEFAULT_GIFT_TITLE, DEFAULT_GIFT_PRICE)
     await c.message.answer(f"{E['warn']} Limited gift detected (test) — will try to buy if Auto-Buy is ON.")
-    async with await open_db() as db:
-        u = await ensure_user(db, c.from_user.id)
-        if u.auto_on:
-            # try to burn cycles (up to balance/budget)
-            max_units = min(u.cycles, (await credit_of(db, u.user_id)) // GIFT_PRICE)
-            if max_units > 0:
-                sent, _ = await buy_units(db, u, max_units, "AUTO")
-                if sent == 0:
-                    await c.answer("Auto-Buy failed (see logs).", show_alert=True)
+    # try buy for the clicker if auto_on
+    u = await ensure_user(c.from_user.id)
+    if u.auto_on:
+        title, price = await get_current_gift()
+        max_units = min(u.cycles, (await credit_of(u.user_id)) // price)
+        if max_units > 0:
+            await buy_units(bot, u, price, max_units, "AUTO")
 
-# ---- Real notifier: auto-runs when the channel posts about a new limited gift ----
+# Real notifier → Auto-Buy on new channel posts (your channel = your signal)
 @router.channel_post()
 async def on_channel_post(msg: Message):
     if not NOTIFIER_CHANNEL_ID:  # disabled
@@ -564,36 +596,35 @@ async def on_channel_post(msg: Message):
     if str(msg.chat.id) != str(NOTIFIER_CHANNEL_ID):
         return
     text = (msg.text or msg.caption or "")
-    price = parse_price_from_text(text) or GIFT_PRICE
-    # broadcast to admins who enabled auto
-    async with await open_db() as db:
-        for aid in ADMINS:
-            u = await ensure_user(db, aid)
-            if not u.auto_on:
-                continue
-            max_units = min(u.cycles, (await credit_of(db, u.user_id)) // price)
-            if max_units <= 0:
-                await add_log(db, u.user_id, "AUTO_SKIP", "insufficient balance"); continue
-            # If the limited gift has a different price (e.g., 50/100), adapt to that price.
-            global GIFT_PRICE
-            old_price = GIFT_PRICE
-            try:
-                GIFT_PRICE = price
-                sent, info = await buy_units(db, u, max_units, "AUTO")
-                if sent == 0:
-                    await add_log(db, u.user_id, "AUTO_FAIL", info)
-            finally:
-                GIFT_PRICE = old_price
+    price = parse_price_from_text(text) or DEFAULT_GIFT_PRICE
+    # Try to grab a name/emoji from the message; fallback to 💝
+    name = "💝 Limited Gift"
+    m_title = re.search(r"gift[:\s\-]*([^\n]+)", text, re.I)
+    if m_title:
+        name = f"💝 {m_title.group(1).strip()}"
+    await set_current_gift(name, price)
+    # Auto-buy for each admin with auto_on
+    for uid in ADMINS:
+        u = await ensure_user(uid)
+        if not u.auto_on:
+            continue
+        max_units = min(u.cycles, (await credit_of(uid)) // price)
+        if max_units <= 0:
+            await add_log(uid, "AUTO_SKIP", "insufficient balance")
+            continue
+        sent, info = await buy_units(bot, u, price, max_units, "AUTO")
+        if sent == 0:
+            await add_log(uid, "AUTO_FAIL", info)
 
-# ------------- Background -------------
+# ─────────────────────── Background ───────────────────────
 async def background_task():
+    # Reserved for future periodic checks; keep lightweight.
     while True:
         await asyncio.sleep(60)
 
-# ------------- Run -------------
+# ───────────────────────── Run ─────────────────────────
 async def main():
-    async with await open_db() as db:
-        pass
+    await ensure_schema()
     asyncio.create_task(background_task())
     await dp.start_polling(bot)
 
