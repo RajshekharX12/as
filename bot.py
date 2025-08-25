@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 
 # ───────── EDIT ONLY THIS VALUE ─────────
-RAW_BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"   # ← your token here (just the token)
+RAW_BOT_TOKEN = "8276504603:AAGNaiwK1Lp6nteXzcc5Qc7lyJ9C2yS0ydw"   # ← your token here (just the token)
 ADMINS = {7940894807, 5770074932}             # allowed users (private bot)
 DB_PATH = "./autobuy.sqlite3"
 PRICE_MIN_DEFAULT = 100
