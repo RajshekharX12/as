@@ -434,18 +434,19 @@ async def try_debit(uid: int, cost: int) -> tuple[bool, str]:
 async def send_fake_gift(chat_id: int, emoji: str, name: str, total_cost: int, qty: int, mode: str):
     caption = f"<b>Gift from Dream</b>\nMode: <i>{mode}</i>\n{emoji} {name} × <b>{qty}</b>\nSpent: <b>{total_cost}⭐</b>"
     await bot.send_message(chat_id, caption)
-
-@dp.callback_query(F.data.startswith("buy:")))
+@dp.callback_query(F.data.startswith("buy:"))
 async def on_buy(cq: types.CallbackQuery):
     # data: buy:<gid>:<count>
     _, gid, count_s = cq.data.split(":")
     count = int(count_s)
     g = next(x for x in CATALOG if x["id"] == gid)
     cost = g["price"] * count
+
     ok, reason = await try_debit(cq.from_user.id, cost)
     if not ok:
         await cq.answer(reason, show_alert=True)
         return
+
     await db_log(cq.from_user.id, "BUY", f"{g['name']}×{count} cost={cost}")
     await send_fake_gift(cq.from_user.id, g["emoji"], g["name"], cost, count, "Manual")
     await cq.answer("Purchased ✅", show_alert=False)
