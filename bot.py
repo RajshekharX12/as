@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command
 from aiogram.types import LabeledPrice, ForceReply, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -59,6 +60,48 @@ async def db_init():
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           gift_id TEXT, star_count INTEGER, recipient TEXT, result_ok INTEGER, ts INTEGER
         )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS settings(
+          key TEXT PRIMARY KEY, val TEXT
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS blocked(
+          gift_id TEXT PRIMARY KEY
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS last_seen(
+          gift_id TEXT PRIMARY KEY, ts INTEGER
+        )""")
+        await db.commit()
+
+# settings helpers
+async def settings_set(key: str, val: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO settings(key,val) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET val=excluded.val", (key, val))
+        await db.commit()
+
+async def settings_get(key: str, default: Optional[str] = None) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT val FROM settings WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else default
+
+async def blocked_load():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT gift_id FROM blocked") as cur:
+            rows = await cur.fetchall()
+            store.blocked_ids = {r[0] for r in rows}
+
+async def last_seen_load():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT gift_id FROM last_seen") as cur:
+            rows = await cur.fetchall()
+            store.last_seen_ids = {r[0] for r in rows}
+
+async def last_seen_add(gift_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO last_seen(gift_id, ts) VALUES(?,?)",
+                         (gift_id, int(time.time())))
+        # prune to ~2000 rows to avoid growth
+        await db.execute("DELETE FROM last_seen WHERE gift_id NOT IN (SELECT gift_id FROM last_seen ORDER BY ts DESC LIMIT 2000)")
         await db.commit()
 
 async def db_add_payment(user_id: int, charge_id: str, amount: int):
@@ -72,6 +115,24 @@ async def db_add_purchase(gift_id: str, star: int, recipient: str, ok: bool):
         await db.execute("INSERT INTO purchases(gift_id, star_count, recipient, result_ok, ts) VALUES(?,?,?,?,?)",
                          (gift_id, star, recipient, 1 if ok else 0, int(time.time())))
         await db.commit()
+
+async def load_persistent_state():
+    await db_init()
+    # settings
+    v = await settings_get("recipient");        store.recipient  = v if v else store.recipient
+    v = await settings_get("min_price");        store.min_price  = int(v) if v else store.min_price
+    v = await settings_get("max_price");        store.max_price  = int(v) if v else store.max_price
+    v = await settings_get("autobuy");          store.autobuy    = (v == "1") if v else store.autobuy
+    v = await settings_get("multi_buy");        store.multi_buy  = (v == "1") if v else store.multi_buy
+    await blocked_load()
+    await last_seen_load()
+
+async def persist_current_settings():
+    await settings_set("recipient", store.recipient)
+    await settings_set("min_price", str(store.min_price))
+    await settings_set("max_price", str(store.max_price))
+    await settings_set("autobuy", "1" if store.autobuy else "0")
+    await settings_set("multi_buy", "1" if store.multi_buy else "0")
 
 # ---------- helpers ----------
 def is_admin(uid: int) -> bool: return uid in store.admins
@@ -127,10 +188,8 @@ async def get_balance(bot: Bot) -> int:
 
 async def send_gift(bot: Bot, gift: GiftInfo, recipient: str, text: str = "") -> bool:
     try:
-        if recipient.startswith("@"):
-            await bot.send_gift(chat_id=recipient, gift_id=gift.id, text=text)
-        else:
-            await bot.send_gift(user_id=int(recipient), gift_id=gift.id, text=text)
+        # NOTE: Bot API send_gift targets users; keep recipient as numeric user_id for reliability.
+        await bot.send_gift(user_id=int(recipient), gift_id=gift.id, text=text)
         await db_add_purchase(gift.id, gift.star_count, recipient, True)
         return True
     except Exception:
@@ -139,13 +198,18 @@ async def send_gift(bot: Bot, gift: GiftInfo, recipient: str, text: str = "") ->
 
 # ---------- notifier + sniper loop (diff + greedy buy) ----------
 async def sniper_loop(bot: Bot):
-    await db_init()
+    await load_persistent_state()
     while True:
         try:
             gifts = await fetch_available_gifts(bot)
             current_ids = {g.id for g in gifts}
+
+            # detect newly appeared gifts
             appeared = [g for g in gifts if g.id not in store.last_seen_ids]
-            store.last_seen_ids = current_ids
+            for g in appeared:
+                # record appearance immediately (persistent) to avoid spam after restart
+                await last_seen_add(g.id)
+                store.last_seen_ids.add(g.id)
 
             # notify on newly appeared limited gifts in-band
             for g in appeared:
@@ -162,7 +226,7 @@ async def sniper_loop(bot: Bot):
 
             # candidates: limited + price band
             candidates = [g for g in gifts if is_limited(g) and in_band(g)]
-            # cheaper first, then scarcer first (lower remaining)
+            # cheaper first, then scarcer first
             candidates.sort(key=lambda x: (x.star_count, (x.remaining_count or 10**9)))
 
             bal = await get_balance(bot)
@@ -176,6 +240,7 @@ async def sniper_loop(bot: Bot):
                     bal -= g.star_count
                     if not store.multi_buy:
                         break
+
             await asyncio.sleep(SCAN_INTERVAL_MS / 1000)
         except Exception:
             # never die on transient errors
@@ -186,10 +251,10 @@ async def sniper_loop(bot: Bot):
 async def on_start(m: types.Message, bot: Bot):
     if not is_admin(m.from_user.id):
         return await m.answer("Access denied.")
+    await persist_current_settings()
     bal = await get_balance(bot)
     await m.answer("Bot online ✅")
-    text = panel_text(bal)
-    msg = await m.answer(text, reply_markup=panel_kb())
+    msg = await m.answer(panel_text(bal), reply_markup=panel_kb())
     store.panel_chat_id, store.panel_msg_id = m.chat.id, msg.message_id
 
 @router.message(Command("panel"))
@@ -206,6 +271,7 @@ async def on_band(m: types.Message):
     if len(parts) == 3:
         store.min_price = max(1, int(parts[1]))
         store.max_price = max(store.min_price, int(parts[2]))
+        await persist_current_settings()
         return await m.answer(f"✅ Band set to {store.min_price}→{store.max_price}⭐")
     await m.answer("Usage: /band <min> <max>")
 
@@ -213,7 +279,7 @@ async def on_band(m: types.Message):
 async def on_recipient_cmd(m: types.Message):
     if not is_admin(m.from_user.id): return
     store.waiting[m.from_user.id] = "set_recipient"
-    await m.answer("Reply with <user_id> or @channel", reply_markup=ForceReply(selective=True))
+    await m.answer("Reply with numeric <user_id>", reply_markup=ForceReply(selective=True))
 
 @router.message(Command("balance"))
 async def on_balance(m: types.Message, bot: Bot):
@@ -227,9 +293,7 @@ async def on_deposit_cmd(m: types.Message, bot: Bot):
     parts = m.text.strip().split()
     if len(parts) != 2:
         return await m.answer("Usage: /deposit <stars>")
-    stars = int(parts[1])
-    if stars <= 0:
-        return await m.answer("Amount must be > 0.")
+    stars = int(parts[1]);  if stars <= 0: return await m.answer("Amount must be > 0.")
     await bot.send_invoice(
         chat_id=m.chat.id,
         title="Deposit",
@@ -237,7 +301,7 @@ async def on_deposit_cmd(m: types.Message, bot: Bot):
         payload=f"deposit:{stars}",
         currency="XTR",
         prices=[LabeledPrice(label="Deposit", amount=stars)],
-        provider_token=""  # XTR doesn’t need provider token (digital goods)
+        provider_token=""  # XTR supports empty provider token for digital goods
     )
 
 @router.message(Command("refund"))
@@ -245,6 +309,16 @@ async def on_refund_cmd(m: types.Message):
     if not is_admin(m.from_user.id): return
     store.waiting[m.from_user.id] = "refund"
     await m.answer("Reply with <telegram_payment_charge_id>", reply_markup=ForceReply(selective=True))
+
+@router.message(Command("resetseen"))
+async def on_reset_seen(m: types.Message):
+    """If you ever want to clear 'last-seen' cache manually."""
+    if not is_admin(m.from_user.id): return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM last_seen")
+        await db.commit()
+    store.last_seen_ids.clear()
+    await m.answer("🧹 Cleared last-seen cache.")
 
 # ---------- Replies for ForceReply prompts ----------
 @router.message(F.reply_to_message, F.from_user)
@@ -256,6 +330,7 @@ async def on_force_reply(m: types.Message, bot: Bot):
 
     if action == "set_recipient":
         store.recipient = m.text.strip()
+        await persist_current_settings()
         await m.answer(f"📦 Recipient set to: <code>{store.recipient}</code>", parse_mode="HTML")
     elif action == "refund":
         try:
@@ -286,9 +361,11 @@ async def on_panel_cb(q: CallbackQuery, bot: Bot):
 
     if action == "toggle":
         store.autobuy = not store.autobuy
+        await persist_current_settings()
         await q.answer(f"Auto-buy {'ON' if store.autobuy else 'OFF'}")
     elif action == "multi":
         store.multi_buy = not store.multi_buy
+        await persist_current_settings()
         await q.answer(f"Multi-buy {'ON' if store.multi_buy else 'OFF'}")
     elif action in ("min", "max"):
         delta = int(rest[0])
@@ -298,10 +375,11 @@ async def on_panel_cb(q: CallbackQuery, bot: Bot):
                 store.max_price = store.min_price
         else:
             store.max_price = max(store.min_price, store.max_price + delta)
+        await persist_current_settings()
         await q.answer(f"Band {store.min_price}→{store.max_price}⭐")
     elif action == "set_recipient":
         store.waiting[q.from_user.id] = "set_recipient"
-        await q.message.answer("Reply with <user_id> or @channel", reply_markup=ForceReply(selective=True))
+        await q.message.answer("Reply with numeric <user_id>", reply_markup=ForceReply(selective=True))
         await q.answer()
         return
     elif action == "balance":
@@ -338,9 +416,12 @@ async def on_panel_cb(q: CallbackQuery, bot: Bot):
         pass
 
 async def main():
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    # ✅ Aiogram ≥3.7 correct init:
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
+    # load persisted state before starting loop
+    await load_persistent_state()
     asyncio.create_task(sniper_loop(bot))
     print("Auto Gift Buyer running…")
     await dp.start_polling(bot)
