@@ -1,9 +1,10 @@
 import asyncio
+import csv
 import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Optional, List, Tuple
 
 import aiosqlite
@@ -19,6 +20,7 @@ from aiogram.types import (
     LabeledPrice,
     Message,
     PreCheckoutQuery,
+    FSInputFile,
 )
 from dotenv import load_dotenv
 
@@ -56,6 +58,12 @@ dp = Dispatcher()
 def db():
     # IMPORTANT: return the connection (do NOT await here)
     return aiosqlite.connect(DB_PATH)
+
+async def ensure_column(con, table: str, column: str, decl: str):
+    cur = await con.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in await cur.fetchall()]
+    if column not in cols:
+        await con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 async def init_db():
     async with db() as con:
@@ -102,15 +110,10 @@ async def init_db():
                 created  INTEGER NOT NULL
             )
         """)
-        await con.execute("""
-            CREATE TABLE IF NOT EXISTS support_threads(
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id  INTEGER NOT NULL,
-                msg_in   TEXT NOT NULL,
-                msg_out  TEXT NOT NULL,
-                ts       INTEGER NOT NULL
-            )
-        """)
+        # Migrations (new columns)
+        await ensure_column(con, "users", "per_drop_max", "INTEGER DEFAULT 1")
+        await ensure_column(con, "users", "gift_ttl_hours", "INTEGER DEFAULT 24")
+        await ensure_column(con, "users", "spent_day", "INTEGER DEFAULT 0")
         await con.commit()
 
 # User defaults
@@ -126,6 +129,10 @@ DEFAULT_USER = {
     "spent_today": 0,
     "credit": 0,
     "notifier_id": None,
+    # new
+    "per_drop_max": 1,
+    "gift_ttl_hours": 24,
+    "spent_day": 0,
 }
 
 # User helpers
@@ -208,10 +215,10 @@ async def gifts_active() -> List[dict]:
 
 async def gift_get(gid: str) -> Optional[dict]:
     async with db() as con:
-        cur = await con.execute("SELECT gid, emoji, name, price, active FROM gifts WHERE gid=?", (gid,))
+        cur = await con.execute("SELECT gid, emoji, name, price, active, created FROM gifts WHERE gid=?", (gid,))
         r = await cur.fetchone()
         if not r: return None
-        return dict(gid=r[0], emoji=r[1], name=r[2], price=r[3], active=bool(r[4]))
+        return dict(gid=r[0], emoji=r[1], name=r[2], price=r[3], active=bool(r[4]), created=r[5])
 
 async def gift_upsert(gid: str, emoji: str, name: str, price: int, active: int = 1):
     async with db() as con:
@@ -229,9 +236,40 @@ async def gifts_clear():
         await con.execute("DELETE FROM gifts")
         await con.commit()
 
+async def gift_gc(ttl_hours: int) -> int:
+    """Deactivate gifts older than ttl_hours."""
+    cutoff = int(datetime.now(tz=timezone.utc).timestamp()) - ttl_hours * 3600
+    async with db() as con:
+        cur = await con.execute("UPDATE gifts SET active=0 WHERE created < ? AND active=1", (cutoff,))
+        await con.commit()
+        return cur.rowcount
+
+async def gift_gc_loop():
+    while True:
+        try:
+            # collect unique TTLs among users (use smallest)
+            async with db() as con:
+                cur = await con.execute("SELECT MIN(gift_ttl_hours) FROM users")
+                row = await cur.fetchone()
+                ttl = row[0] if row and row[0] else 24
+            n = await gift_gc(int(ttl))
+            if n:
+                await db_log(None, "GC", f"Archived {n} gift(s)")
+        except Exception as e:
+            log.warning("gift_gc_loop error: %s", e)
+        await asyncio.sleep(600)  # every 10min
+
 # Support memory
 async def support_push(uid: int, user_text: str, bot_text: str):
     async with db() as con:
+        await con.execute("""
+            CREATE TABLE IF NOT EXISTS support_threads(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                msg_in TEXT NOT NULL,
+                msg_out TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            )""")
         await con.execute(
             "INSERT INTO support_threads(user_id, msg_in, msg_out, ts) VALUES(?,?,?,?)",
             (uid, user_text, bot_text, int(datetime.now(tz=timezone.utc).timestamp()))
@@ -260,15 +298,15 @@ def pretty_inf(n: int, suffix="⭐"):
 def main_menu_kb(u: dict) -> InlineKeyboardMarkup:
     auto = "ON ✅" if u.get("auto_on") else "OFF ❌"
     rows = [
-        [InlineKeyboardButton(f"{E['bolt']} Auto-Buy: {auto}", callback_data="auto:toggle"),
-         InlineKeyboardButton(f"{E['health']} Health", callback_data="menu:health")],
-        [InlineKeyboardButton(f"{E['gear']} Auto-Purchase Settings", callback_data="menu:settings")],
-        [InlineKeyboardButton(f"{E['gift']} Gift Catalog", callback_data="menu:catalog")],
-        [InlineKeyboardButton(f"{E['profile']} Profile", callback_data="menu:profile"),
-         InlineKeyboardButton(f"{E['deposit']} Deposit", callback_data="menu:deposit")],
-        [InlineKeyboardButton(f"{E['rocket']} Test Event", callback_data="menu:test"),
-         InlineKeyboardButton(f"{E['logs']} Logs", callback_data="menu:logs")],
-        [InlineKeyboardButton(f"{E['support']} Support", callback_data="menu:support")],
+        [InlineKeyboardButton(text=f"{E['bolt']} Auto-Buy: {auto}", callback_data="auto:toggle"),
+         InlineKeyboardButton(text=f"{E['health']} Health", callback_data="menu:health")],
+        [InlineKeyboardButton(text=f"{E['gear']} Auto-Purchase Settings", callback_data="menu:settings")],
+        [InlineKeyboardButton(text=f"{E['gift']} Gift Catalog", callback_data="menu:catalog")],
+        [InlineKeyboardButton(text=f"{E['profile']} Profile", callback_data="menu:profile"),
+         InlineKeyboardButton(text=f"{E['deposit']} Deposit", callback_data="menu:deposit")],
+        [InlineKeyboardButton(text=f"{E['rocket']} Test Event", callback_data="menu:test"),
+         InlineKeyboardButton(text=f"{E['logs']} Logs", callback_data="menu:logs")],
+        [InlineKeyboardButton(text=f"{E['support']} Support", callback_data="menu:support")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -276,20 +314,24 @@ def settings_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
     txt = (
         f"{E['gear']} <b>Auto-Purchase Settings</b>\n"
         f"Cycles: <b>{u.get('cycles',1)}</b>\n"
+        f"Per-drop max: <b>{u.get('per_drop_max',1)}</b>\n"
         f"Lower limit: <b>{pretty_inf(u.get('lower_limit',0))}</b>\n"
         f"Upper limit: <b>{pretty_inf(u.get('upper_limit',0))}</b>\n"
         f"Overall limit: <b>{pretty_inf(u.get('overall_limit',0))}</b>\n"
         f"Supply limit: <b>{pretty_inf(u.get('supply_limit',0), suffix='')}</b>\n"
-        f"Daily budget: <b>{pretty_inf(u.get('daily_budget',0))}</b>"
+        f"Daily budget: <b>{pretty_inf(u.get('daily_budget',0))}</b>\n"
+        f"Gift TTL: <b>{u.get('gift_ttl_hours',24)}h</b>"
     )
     rows = [
-        [InlineKeyboardButton("Cycles", callback_data="set:cycles")],
-        [InlineKeyboardButton("Lower limit", callback_data="set:lower"),
-         InlineKeyboardButton("Upper limit", callback_data="set:upper")],
-        [InlineKeyboardButton("Overall limit", callback_data="set:overall"),
-         InlineKeyboardButton("Supply limit", callback_data="set:supply")],
-        [InlineKeyboardButton("Daily budget", callback_data="set:daily")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")],
+        [InlineKeyboardButton(text="Cycles", callback_data="set:cycles"),
+         InlineKeyboardButton(text="Per-drop max", callback_data="set:perdrop")],
+        [InlineKeyboardButton(text="Lower limit", callback_data="set:lower"),
+         InlineKeyboardButton(text="Upper limit", callback_data="set:upper")],
+        [InlineKeyboardButton(text="Overall limit", callback_data="set:overall"),
+         InlineKeyboardButton(text="Supply limit", callback_data="set:supply")],
+        [InlineKeyboardButton(text="Daily budget", callback_data="set:daily"),
+         InlineKeyboardButton(text="Gift TTL (h)", callback_data="set:giftttl")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")],
     ]
     return txt, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -299,36 +341,36 @@ def catalog_list_kb(items: List[dict], page=0, per_page=6):
     title = f"{E['gift']} <b>Catalog</b>"
     rows = []
     if not chunk:
-        rows.append([InlineKeyboardButton("No gifts yet — Add one", callback_data="cat:add")])
+        rows.append([InlineKeyboardButton(text="No gifts yet — Add one", callback_data="cat:add")])
     else:
         for g in chunk:
             rows.append([InlineKeyboardButton(
-                f"{g['emoji']} {g['name']} — {g['price']}⭐", callback_data=f"cat:sel:{g['gid']}")])
+                text=f"{g['emoji']} {g['name']} — {g['price']}⭐", callback_data=f"cat:sel:{g['gid']}")])
         nav = []
-        if start > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"cat:page:{page-1}"))
-        if start + per_page < len(items): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"cat:page:{page+1}"))
+        if start > 0: nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"cat:page:{page-1}"))
+        if start + per_page < len(items): nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"cat:page:{page+1}"))
         if nav: rows.append(nav)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back:main")])
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")])
     return title, InlineKeyboardMarkup(inline_keyboard=rows)
 
 def catalog_detail_kb(g: dict):
     header = f"{E['gift']} <b>{g['emoji']} {g['name']}</b> <i>({g['price']}⭐ each)</i>"
     rows, row = [], []
     for i, n in enumerate(PACKS, 1):
-        row.append(InlineKeyboardButton(f"{n}× for {n*g['price']}⭐", callback_data=f"buy:{g['gid']}:{n}"))
+        row.append(InlineKeyboardButton(text=f"{n}× for {n*g['price']}⭐", callback_data=f"buy:{g['gid']}:{n}"))
         if i % 2 == 0:
             rows.append(row); row = []
     if row: rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:catalog")])
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="menu:catalog")])
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 def deposit_kb():
     rows = [
-        [InlineKeyboardButton("Add 50⭐", callback_data="deposit:50"),
-         InlineKeyboardButton("Add 1000⭐", callback_data="deposit:1000"),
-         InlineKeyboardButton("Add 3000⭐", callback_data="deposit:3000")],
-        [InlineKeyboardButton("Custom amount…", callback_data="deposit:custom")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")],
+        [InlineKeyboardButton(text="Add 50⭐", callback_data="deposit:50"),
+         InlineKeyboardButton(text="Add 1000⭐", callback_data="deposit:1000"),
+         InlineKeyboardButton(text="Add 3000⭐", callback_data="deposit:3000")],
+        [InlineKeyboardButton(text="Custom amount…", callback_data="deposit:custom")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -342,15 +384,16 @@ COMMANDS_TEXT = (
     "/start — open menu\n"
     "/menu — open menu\n"
     "/help — show commands\n"
-    "/support — talk to support (short replies, remembers thread)\n"
+    "/support — talk to support (short, remembers thread)\n"
     "/deposit — deposit Stars\n"
     "/source &lt;channel_id&gt; — set notifier channel (bot must be admin)\n"
     "/addgift — add a gift (emoji name | price)\n"
     "/listgifts — list active gifts\n"
     "/cleargifts — delete all gifts\n"
+    "/giftgc — archive stale gifts now\n"
+    "/exportlogs — export last 200 logs (CSV)\n"
     "/stats — show stats\n"
     "/ping — check bot\n"
-    "/resetday — reset today’s spend\n"
 )
 
 # ───────────────────────── Start / Help / Ping ─────────────────────────
@@ -371,7 +414,7 @@ async def cmd_ping(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer("pong")
 
-@dp.message(Command("stats"))
+@dp.message(Command("stats")))
 async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id): return
     u = await get_user(m.from_user.id)
@@ -379,16 +422,9 @@ async def cmd_stats(m: Message):
     await m.answer(
         f"Users: {len(await db_all_users())}\n"
         f"Active gifts: {len(glist)}\n"
-        f"Credit: {u.get('credit',0)}⭐\nAuto: {'ON' if u.get('auto_on') else 'OFF'}"
+        f"Credit: {u.get('credit',0)}⭐\nAuto: {'ON' if u.get('auto_on') else 'OFF'}\n"
+        f"Per-drop max: {u.get('per_drop_max',1)} | TTL: {u.get('gift_ttl_hours',24)}h"
     )
-
-@dp.message(Command("resetday"))
-async def cmd_resetday(m: Message):
-    if not is_admin(m.from_user.id): return
-    u = await get_user(m.from_user.id)
-    u["spent_today"] = 0
-    await db_save_user(m.from_user.id, u)
-    await m.answer("Day spend reset.")
 
 # ───────────────────────── Support (short, remembers) ─────────────────────────
 @dp.callback_query(F.data == "menu:support")
@@ -396,32 +432,30 @@ async def menu_support(cq: types.CallbackQuery, state: FSMContext):
     await state.set_state(Entry.support)
     await cq.message.edit_text(
         f"{E['support']} <b>Support</b>\n"
-        "Write your issue in one message. I’ll reply short.\n"
-        "Tip: keep Auto-Buy ON and connect a notifier channel for instant drops.",
+        "Send one message with your issue. I’ll reply short.\n",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]
         ])
     )
 
+@dp.message(Command("support"))
+async def cmd_support(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await state.set_state(Entry.support)
+    await m.answer("Send your issue (one message). Short reply, I’ll remember context.")
+
 @dp.message(Entry.support)
 async def support_flow(m: Message, state: FSMContext):
-    # short response + remember last 5 exchanges
     text = (m.text or "").strip()
     summary = "Noted. Checking logs & limits. Reply if urgent."
     await support_push(m.from_user.id, text, summary)
     tail = await support_tail(m.from_user.id, 3)
-    # very small thread echo
     if tail:
         bullets = "\n".join(f"• {t[0][:48]}…" for t in tail[::-1])
         await m.answer(f"{summary}\nRecent:\n{bullets}")
     else:
         await m.answer(summary)
     await state.clear()
-
-@dp.message(Command("support"))
-async def cmd_support(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
-    await menu_support(types.CallbackQuery(message=m, data="menu:support"), state)  # reuse view
 
 # ───────────────────────── Profile / Health / Logs ─────────────────────────
 @dp.callback_query(F.data == "menu:profile")
@@ -431,12 +465,13 @@ async def menu_profile(cq: types.CallbackQuery):
         f"{E['profile']} <b>Profile</b>\n"
         f"{E['wallet']} Internal credit: <b>{u.get('credit',0)}⭐</b>\n"
         f"♻️ Auto cycles: <b>{u.get('cycles',1)}</b>\n"
+        f"Per-drop max: <b>{u.get('per_drop_max',1)}</b>\n"
         f"Daily budget: <b>{pretty_inf(u.get('daily_budget',0))}</b>\n"
         f"{E['bolt']} Auto: <b>{'on' if u.get('auto_on') else 'off'}</b>"
     )
     await cq.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton("Refunds / Credits", callback_data="menu:refunds")],
-                         [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]]
+        inline_keyboard=[[InlineKeyboardButton(text="Refunds / Credits", callback_data="menu:refunds")],
+                         [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]]
     ))
 
 @dp.callback_query(F.data == "menu:health")
@@ -456,16 +491,30 @@ async def menu_health(cq: types.CallbackQuery):
     ]
     for k, msg in rows:
         lines.append(f"• <code>{k}</code> — {msg}")
-    await cq.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton("⬅️ Back", callback_data="back:main")]]
-    ))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Test Notifier", callback_data="health:test")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]
+    ])
+    await cq.message.edit_text("\n".join(lines), reply_markup=kb)
+
+@dp.callback_query(F.data == "health:test")
+async def health_test_notifier(cq: types.CallbackQuery):
+    u = await get_user(cq.from_user.id)
+    ch = u.get("notifier_id")
+    if not ch:
+        await cq.answer("No notifier set. Use /source <id>.", show_alert=True); return
+    try:
+        await bot.send_message(ch, "🧪 Notifier test from Beast: OK.")
+        await cq.answer("Posted ✅", show_alert=False)
+    except Exception as e:
+        await cq.answer(f"Failed: {e}", show_alert=True)
 
 @dp.callback_query(F.data == "menu:logs")
 async def menu_logs(cq: types.CallbackQuery):
     rows = await db_last_logs(cq.from_user.id, 20)
     out = (f"{E['logs']} <b>Logs</b>\n" + "\n".join(f"• <code>{k}</code> — {msg}" for k, msg in rows)) if rows else "— empty —"
     await cq.message.edit_text(out, reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton("⬅️ Back", callback_data="back:main")]]
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]]
     ))
 
 # ───────────────────────── Settings ─────────────────────────
@@ -476,12 +525,14 @@ async def menu_settings(cq: types.CallbackQuery):
     await cq.message.edit_text(txt, reply_markup=kb)
 
 ENTRY_MAP = {
-    "set:cycles":  ("Send number of cycles (0 = ∞).", "cycles"),
-    "set:lower":   ("Send LOWER price limit in ⭐ (0 = none).", "lower_limit"),
-    "set:upper":   ("Send UPPER price limit in ⭐ (0 = none).", "upper_limit"),
-    "set:overall": ("Send OVERALL limit in ⭐ (0 = ∞).", "overall_limit"),
-    "set:supply":  ("Send SUPPLY limit in pcs (0 = ∞).", "supply_limit"),
-    "set:daily":   ("Send DAILY budget in ⭐ (0 = ∞).", "daily_budget"),
+    "set:cycles":   ("Send number of cycles (0 = ∞).", "cycles"),
+    "set:perdrop":  ("Send MAX pieces per drop (>=1).", "per_drop_max"),
+    "set:lower":    ("Send LOWER price limit in ⭐ (0 = none).", "lower_limit"),
+    "set:upper":    ("Send UPPER price limit in ⭐ (0 = none).", "upper_limit"),
+    "set:overall":  ("Send OVERALL limit in ⭐ (0 = ∞).", "overall_limit"),
+    "set:supply":   ("Send SUPPLY limit in pcs (0 = ∞).", "supply_limit"),
+    "set:daily":    ("Send DAILY budget in ⭐ (0 = ∞).", "daily_budget"),
+    "set:giftttl":  ("Send Gift TTL in hours (e.g., 24).", "gift_ttl_hours"),
 }
 
 class EntryFields(StatesGroup):
@@ -493,7 +544,7 @@ async def ask_field(cq: types.CallbackQuery, state: FSMContext):
     await state.set_state(Entry.field)
     await state.update_data(field=field)
     await cq.message.edit_text(prompt, reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton("⬅️ Back", callback_data="menu:settings")]]
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="menu:settings")]]
     ))
 
 @dp.message(Entry.field)
@@ -502,6 +553,7 @@ async def set_field(m: Message, state: FSMContext):
     field = data.get("field")
     try:
         v = int(m.text.strip()); v = max(0, v)
+        if field == "per_drop_max" and v < 1: v = 1
     except Exception:
         await m.answer("Numbers only. Try again."); return
     await set_user(m.from_user.id, **{field: v})
@@ -530,29 +582,20 @@ async def catalog_add_btn(cq: types.CallbackQuery, state: FSMContext):
     await cq.message.edit_text(
         "Send gift like:\n<code>🧸 Teddy | 15</code>\n(emoji name | price)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("⬅️ Back", callback_data="menu:catalog")]
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="menu:catalog")]
         ])
     )
 
 @dp.message(Entry.addgift)
 async def addgift_input(m: Message, state: FSMContext):
     text = (m.text or "").strip()
-    m_gift = re.match(r"^(\X)\s*(.+)\|\s*(\d+)$", text, re.UNICODE)
-    # Fallback: basic split by '|'
-    if not m_gift:
-        parts = [p.strip() for p in text.split("|")]
-        if len(parts) == 2 and parts[0] and parts[1].isdigit():
-            # try to split first token for emoji & name
-            first = parts[0]
-            emoji = first.split()[0]
-            name = first[len(emoji):].strip() or "Gift"
-            price = int(parts[1])
-        else:
-            await m.answer("Format: <code>🧸 Teddy | 15</code>"); return
-    else:
-        emoji = m_gift.group(1)
-        name = m_gift.group(2).strip()
-        price = int(m_gift.group(3))
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) != 2 or not parts[1].isdigit():
+        await m.answer("Format: <code>🧸 Teddy | 15</code>"); return
+    first = parts[0]
+    emoji = first.split()[0]
+    name = first[len(emoji):].strip() or "Gift"
+    price = int(parts[1])
     gid = re.sub(r"\s+", "_", name.lower())[:40]
     await gift_upsert(gid, emoji, name, price, 1)
     await state.clear()
@@ -568,13 +611,24 @@ async def catalog_detail(cq: types.CallbackQuery):
     await cq.message.edit_text(header, reply_markup=kb)
 
 # ───────────────────────── Manual Buy ─────────────────────────
+def today_key() -> int:
+    d = date.today()
+    return d.year*10000 + d.month*100 + d.day
+
 async def try_debit(uid: int, cost: int) -> tuple[bool, str]:
     u = await get_user(uid)
+    # daily rollover
+    if u.get("spent_day", 0) != today_key():
+        u["spent_day"] = today_key()
+        u["spent_today"] = 0
     if u["credit"] < cost:
+        await db_save_user(uid, u)
         return False, "Insufficient credit."
     if u.get("daily_budget", 0) and u.get("spent_today", 0) + cost > u["daily_budget"]:
+        await db_save_user(uid, u)
         return False, "Daily budget exceeded."
     if u.get("overall_limit", 0) and u["overall_limit"] < cost:
+        await db_save_user(uid, u)
         return False, "Overall limit reached."
     u["credit"] -= cost
     u["spent_today"] += cost
@@ -606,10 +660,9 @@ async def on_buy(cq: types.CallbackQuery):
     for _ in range(count):
         ok2, why = await try_send_gift(cq.from_user.id, g["price"], "Manual")
         if not ok2:
-            # rollback remaining (partial not rolled back)
             await db_log(cq.from_user.id, "BUY_FAIL", why); break
         sent += 1
-        await asyncio.sleep(0.05)  # tiny spacing
+        await asyncio.sleep(0.05)
 
     await db_log(cq.from_user.id, "BUY", f"{g['name']}×{sent}/{count} cost={total}")
     await cq.answer(("Purchased ✅" if sent == count else f"Partial: {sent}/{count}"), show_alert=(sent != count))
@@ -651,7 +704,7 @@ async def dep_quick(cq: types.CallbackQuery, state: FSMContext):
         await state.set_state(Entry.deposit)
         await cq.message.edit_text(
             f"Send the Stars amount (e.g., 3300). Min {MIN_XTR}, Max {MAX_XTR}.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("⬅️ Back", callback_data="menu:deposit")]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="menu:deposit")]])
         ); return
     await send_invoice(cq.from_user.id, int(val))
 
@@ -669,8 +722,8 @@ async def dep_custom(m: Message, state: FSMContext):
 async def refunds_menu(cq: types.CallbackQuery):
     txt = "Refunds / Credits — internal only (Telegram Stars are final)."
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("↩️ Refund last purchase (credit)", callback_data="credit:refund_last")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+        [InlineKeyboardButton(text="↩️ Refund last purchase (credit)", callback_data="credit:refund_last")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]
     ])
     await cq.message.edit_text(txt, reply_markup=kb)
 
@@ -711,7 +764,6 @@ def parse_price_from_text(s: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def first_emoji(s: str) -> str:
-    # crude: return first non-alnum char assuming it's an emoji
     for ch in s.strip():
         if not ch.isalnum() and not ch.isspace():
             return ch
@@ -720,7 +772,6 @@ def first_emoji(s: str) -> str:
 @dp.channel_post()
 async def on_channel_post(msg: Message):
     text = (msg.text or msg.caption or "")
-    # very light heuristic to avoid spam
     if "gift" in text.lower() and ("limited" in text.lower() or "drop" in text.lower()):
         price = parse_price_from_text(text) or 15
         name_line = text.splitlines()[0][:40]
@@ -728,7 +779,6 @@ async def on_channel_post(msg: Message):
         name = re.sub(r"[^A-Za-z0-9 ]", "", name_line).strip() or "Gift"
         gid = re.sub(r"\s+", "_", name.lower() + f"_{price}")[:40]
         await gift_upsert(gid, emoji, name, price, 1)
-        # Auto-buy for all admins whose notifier matches
         for uid in await db_all_users():
             u = await get_user(uid)
             if u.get("auto_on") and u.get("notifier_id") == msg.chat.id:
@@ -741,8 +791,8 @@ async def menu_test(cq: types.CallbackQuery):
     names = ", ".join(f"{g['emoji']} {g['name']}" for g in items) or "— none —"
     txt = f"Test Event\n— Simulate a limited drop.\n\nAvailable gifts now: <b>{len(items)}</b>\n{names}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Simulate drop (notify)", callback_data="test:notify")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+        [InlineKeyboardButton(text="Simulate drop (notify)", callback_data="test:notify")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back:main")]
     ])
     await cq.message.edit_text(txt, reply_markup=kb)
 
@@ -771,27 +821,49 @@ async def try_auto_buy(uid: int):
         await db_log(uid, "AUTO", "No gift matches price filters"); return
 
     cycles = u.get("cycles", 1)
-    qty = 1 if cycles <= 0 else 1  # conservative: 1 per trigger
-    if u.get("supply_limit", 0): qty = min(qty, u["supply_limit"])
+    permax = max(1, int(u.get("per_drop_max", 1)))
+    qty = min(permax, cycles if cycles > 0 else permax)
+    if u.get("supply_limit", 0):
+        qty = min(qty, u["supply_limit"])
     total = g["price"] * qty
 
-    # overall/daily/credit checks + debit
     ok, reason = await try_debit(uid, total)
     if not ok:
         await db_log(uid, "AUTO_FAIL", reason); return
 
-    # try send
     sent = 0
     for _ in range(qty):
         ok2, why = await try_send_gift(uid, g["price"], "Auto")
         if not ok2:
             await db_log(uid, "AUTO_FAIL", why); break
         sent += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.03)  # very fast but not spammy
 
     await db_log(uid, "AUTO_OK" if sent == qty else "AUTO_PARTIAL", f"{g['name']}×{sent}/{qty} cost={total}")
 
-# ───────────────────────── Back & misc ─────────────────────────
+# ───────────────────────── Export logs / Gift GC / Back / Menu ─────────────────────────
+@dp.message(Command("exportlogs"))
+async def cmd_exportlogs(m: Message):
+    if not is_admin(m.from_user.id): return
+    async with db() as con:
+        cur = await con.execute(
+            "SELECT user_id, kind, message, ts FROM logs ORDER BY id DESC LIMIT 200"
+        )
+        rows = await cur.fetchall()
+    path = "/tmp/logs.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["user_id","kind","message","ts"])
+        for r in rows: w.writerow(r)
+    await m.answer_document(FSInputFile(path), caption="Recent logs (CSV)")
+
+@dp.message(Command("giftgc"))
+async def cmd_giftgc(m: Message):
+    if not is_admin(m.from_user.id): return
+    u = await get_user(m.from_user.id)
+    n = await gift_gc(int(u.get("gift_ttl_hours",24)))
+    await m.answer(f"Archived {n} gift(s) older than {u.get('gift_ttl_hours',24)}h.")
+
 @dp.callback_query(F.data == "back:main")
 async def back_main(cq: types.CallbackQuery):
     u = await get_user(cq.from_user.id)
@@ -799,7 +871,8 @@ async def back_main(cq: types.CallbackQuery):
 
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
-    if not is_admin(m.from_user.id): await m.answer(f"{E['lock']} Private bot."); return
+    if not is_admin(m.from_user.id): 
+        await m.answer(f"{E['lock']} Private bot."); return
     u = await get_user(m.from_user.id)
     await m.answer("Menu", reply_markup=main_menu_kb(u))
 
@@ -807,27 +880,6 @@ async def cmd_menu(m: Message):
 async def cmd_deposit(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer("Top up Stars", reply_markup=deposit_kb())
-
-# Admin: add/list/clear gifts
-@dp.message(Command("addgift"))
-async def cmd_addgift(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
-    await state.set_state(Entry.addgift)
-    await m.answer("Send: <code>🧸 Teddy | 15</code>")
-
-@dp.message(Command("listgifts"))
-async def cmd_listgifts(m: Message):
-    if not is_admin(m.from_user.id): return
-    items = await gifts_active()
-    if not items:
-        await m.answer("No gifts."); return
-    lines = [f"• {g['emoji']} {g['name']} — {g['price']}⭐ (gid: <code>{g['gid']}</code>)" for g in items]
-    await m.answer("\n".join(lines))
-
-@dp.message(Command("cleargifts"))
-async def cmd_cleargifts(m: Message):
-    if not is_admin(m.from_user.id): return
-    await gifts_clear(); await m.answer("Cleared gifts.")
 
 # Startup notifier
 async def notify_channels_startup():
@@ -840,6 +892,7 @@ async def notify_channels_startup():
 # ───────────────────────── Run ─────────────────────────
 async def main():
     await init_db()
+    asyncio.create_task(gift_gc_loop())   # background GC for stale gifts
     await notify_channels_startup()
     await dp.start_polling(bot)
 
