@@ -286,14 +286,18 @@ async def on_balance(m: types.Message, bot: Bot):
     if not is_admin(m.from_user.id): return
     bal = await get_balance(bot)
     await m.answer(f"💰 Bot Stars: {bal}⭐")
-
 @router.message(Command("deposit"))
 async def on_deposit_cmd(m: types.Message, bot: Bot):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     parts = m.text.strip().split()
     if len(parts) != 2:
         return await m.answer("Usage: /deposit <stars>")
-    stars = int(parts[1]);  if stars <= 0: return await m.answer("Amount must be > 0.")
+
+    stars = int(parts[1])
+    if stars <= 0:
+        return await m.answer("Amount must be > 0.")
+
     await bot.send_invoice(
         chat_id=m.chat.id,
         title="Deposit",
@@ -301,9 +305,8 @@ async def on_deposit_cmd(m: types.Message, bot: Bot):
         payload=f"deposit:{stars}",
         currency="XTR",
         prices=[LabeledPrice(label="Deposit", amount=stars)],
-        provider_token=""  # XTR supports empty provider token for digital goods
+        provider_token=""  # Stars (XTR) – empty token is fine for digital goods
     )
-
 @router.message(Command("refund"))
 async def on_refund_cmd(m: types.Message):
     if not is_admin(m.from_user.id): return
