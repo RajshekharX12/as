@@ -305,8 +305,7 @@ async def on_deposit_cmd(m: types.Message, bot: Bot):
         payload=f"deposit:{stars}",
         currency="XTR",
         prices=[LabeledPrice(label="Deposit", amount=stars)],
-        provider_token=""  # Stars (XTR) – empty token is fine for digital goods
-    )
+        provider_token=""  # Stars (XTR) – empty token is fine for digital goods )
 @router.message(Command("refund"))
 async def on_refund_cmd(m: types.Message):
     if not is_admin(m.from_user.id): return
