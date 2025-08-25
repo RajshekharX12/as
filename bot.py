@@ -414,7 +414,7 @@ async def cmd_ping(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer("pong")
 
-@dp.message(Command("stats")))
+@dp.message(Command("stats"))
 async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id): return
     u = await get_user(m.from_user.id)
