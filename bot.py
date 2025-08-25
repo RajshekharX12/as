@@ -1,7 +1,7 @@
-# Dream bot — Stars Gifts autobuyer + notifier (final + migration fix)
+# Dream bot — Stars Gifts autobuyer + notifier (final)
 import asyncio, json, os, math, re, traceback
 from contextlib import asynccontextmanager
-from datetime import datetime, time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp, aiosqlite
@@ -19,7 +19,7 @@ if not BOT_TOKEN:
 ADMIN_IDS = {7940894807, 5770074932}  # private bot
 
 DB_PATH = "autogifts.db"
-AUTO_LOOP_SEC   = 0.25
+AUTO_LOOP_SEC   = 0.25   # faster loop
 NOTIFY_LOOP_SEC = 1.0
 
 E = {"gift":"🎁","heart":"💝","star":"⭐","ok":"✅","bad":"❌","back":"⬅️",
@@ -66,13 +66,6 @@ CREATE TABLE IF NOT EXISTS spend_day(
   PRIMARY KEY(user_id, ymd)
 );
 
-CREATE TABLE IF NOT EXISTS tx_credits(
-  tx_id TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL,
-  amount INTEGER NOT NULL,
-  ts INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -99,7 +92,7 @@ async def migrate(db: aiosqlite.Connection):
     async def ensure_cols(table: str, spec: Dict[str,str]):
         have = set()
         async with db.execute(f"PRAGMA table_info({table})") as cur:
-            async for r in cur:
+            async for r in cur:  # cid|name|type|notnull|dflt|pk
                 have.add(r[1])
         for col, sql in spec.items():
             if col not in have:
@@ -122,9 +115,12 @@ async def open_db():
 # ───────── KV helpers (per user keys)
 async def kv_set(key: str, value: dict):
     async with open_db() as db:
-        await db.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                         (key, json.dumps(value)))
+        await db.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)))
         await db.commit()
+
 async def kv_get(key: str) -> Optional[dict]:
     async with open_db() as db:
         async with db.execute("SELECT value FROM kv WHERE key=?", (key,)) as cur:
@@ -151,7 +147,6 @@ async def guser(uid:int)->dict:
         async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
             u = dict(row) if row else {}
-    # defaults if old DB lacked columns
     u.setdefault("credit", 0)
     u.setdefault("auto_on", 0)
     u.setdefault("notify_on", 1)
@@ -193,8 +188,9 @@ def today_ymd()->str: return datetime.utcnow().strftime("%Y-%m-%d")
 
 async def spent_today(uid:int)->int:
     async with open_db() as db:
-        async with db.execute("SELECT spent FROM spend_day WHERE user_id=? AND ymd=?", (uid,today_ymd())) as cur:
-            row = await cur.fetchone(); return int(row["spent"] if row else 0)
+        async with db.execute("SELECT spent FROM spend_day WHERE user_id=? AND ymd=?",(uid,today_ymd())) as cur:
+            row = await cur.fetchone()
+            return int(row["spent"] if row else 0)
 
 async def add_spent(uid:int, delta:int):
     async with open_db() as db:
@@ -222,7 +218,8 @@ class TG:
     async def get_available_gifts(self)->List[Dict[str,Any]]:
         res = await self.call("getAvailableGifts"); return res.get("gifts", [])
     async def send_gift(self, user_id:int, gift_id:str, text:str="")->bool:
-        await self.call("sendGift", {"user_id": user_id, "gift_id": gift_id, "text": text, "is_private": True}); return True
+        await self.call("sendGift", {"user_id": user_id, "gift_id": gift_id, "text": text, "is_private": True})
+        return True
     async def get_my_star_balance(self)->int:
         res = await self.call("getMyStarBalance"); return int(res.get("star_count", 0))
 
@@ -246,16 +243,6 @@ async def gifts_from_api()->List[Dict[str,Any]]:
 
 # ───────── Helpers
 def guard(uid:int)->bool: return uid in ADMIN_IDS
-def in_window(s: str)->bool:
-    if not s: return True
-    try:
-        a,b = s.split("-",1)
-        ha,ma = map(int,a.split(":")); hb,mb = map(int,b.split(":"))
-        from datetime import time as T
-        t1,t2 = T(ha,ma), T(hb,mb)
-        now = datetime.now().time()
-        return (t1<=now<=t2) if t1<=t2 else (now>=t1 or now<=t2)
-    except: return True
 
 # ───────── UI
 router = Router()
@@ -394,8 +381,7 @@ async def settings_menu(c: CallbackQuery):
            f"Lower limit: {s['min_price']}{E['star']}\n"
            f"Upper limit: {s['max_price'] or '∞'}{E['star']}\n"
            f"Daily budget: {s['overall_limit'] or '∞'}{E['star']}\n"
-           f"Supply limit: {s['supply_limit'] or '∞'}\n"
-           f"Window: {s['window'] or '(always)'}")
+           f"Supply limit: {s['supply_limit'] or '∞'}\n")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Cycles", callback_data="set:cycles")],
         [InlineKeyboardButton(text="Lower limit", callback_data="set:min"),
@@ -462,7 +448,8 @@ async def cata_buy(c: CallbackQuery):
         await db.execute("INSERT INTO purchases(user_id,gift_id,title,stars,auto,ts) VALUES (?,?,?,?,?,?)",
                          (uid,gid,title,price,0,int(datetime.now().timestamp())))
         await db.commit()
-    await c.message.answer(f"{E['gift']} Sent {title} for {price}{E['star']}"); await c.answer()
+    await c.message.answer(f"{E['gift']} Sent {title} for {price}{E['star']}")
+    await c.answer()
 
 # ───────── TOP-UP (fixed + custom)
 @router.callback_query(F.data == "topup:menu")
@@ -495,23 +482,164 @@ async def topup_custom(c: CallbackQuery):
 async def on_number_reply(m: Message):
     if await deny(m): return
     p = await kv_get(f"pending:{m.from_user.id}")
-    if not p or p.get("user") != m.from_user.id: return
+    if not p or p.get("user") != m.from_user.id:
+        return
     key = p.get("key"); n = int(m.text)
     if key == "topup_custom":
         if n < 15 or n > 200000:
-            await m.answer("Out of range. Min 15, Max 200000 ⭐."); return
+            await m.answer("Out of range. Min 15, Max 200000 ⭐.")
+            return
         await m.answer(f"Top up Stars\nAdd {n}{E['star']} to bot balance")
-        await kv_set(f"pending:{m.from_user.id}", {}); return
+        await kv_set(f"pending:{m.from_user.id}", {})
+        return
     if key == "refund_tx":
-        # simple numeric TxID -> credit same amount for demo flow
         await add_credit(m.from_user.id, n)
-        await m.answer(f"Credited {n}{E['star']}. Internal: {await credit_of(m.from_user.id)}{E['star']}.")
-        await kv_set(f"pending:{m.from_user.id}", {}); return
+        new_credit = await credit_of(m.from_user.id)
+        await m.answer(f"Credited {n}{E['star']}. Internal: {new_credit}{E['star']}.")
+        await kv_set(f"pending:{m.from_user.id}", {})
+        return
     if key in ("set:cycles","set:min","set:max","set:overall","set:supply"):
         value=int(m.text)
         keymap={"set:cycles":"cycles","set:min":"min_price","set:max":"max_price","set:overall":"overall_limit","set:supply":"supply_limit"}
         await set_setting(m.from_user.id, keymap[key], value)
-        await m.answer("Updated."); await kv_set(f"pending:{m.from_user.id}", {}); return
+        await m.answer("Updated.")
+        await kv_set(f"pending:{m.from_user.id}", {})
+        return
     if key == "credit_add":
         await add_credit(m.from_user.id, n)
-        await m.answer(f"Credit updated. Internal: {await credit_of(m.from_user
+        new_credit = await credit_of(m.from_user.id)
+        await m.answer(f"Credit updated. Internal: {new_credit}{E['star']}.")
+        await kv_set(f"pending:{m.from_user.id}", {})
+        return
+
+# Parse Telegram transfer confirmations to update internal credit
+@router.message()
+async def any_msg(m: Message):
+    if await deny(m): return
+    if not m.text: return
+    m1 = re.search(r"You successfully transferred\s*⭐?\s*(\d+)", m.text)
+    if m1:
+        amount = int(m1.group(1))
+        bonus = 0
+        b1 = re.search(r"\(\+(\d+)\s*⭐\s*bonus\)", m.text)
+        if b1: bonus = int(b1.group(1))
+        total = amount + bonus
+        await add_credit(m.from_user.id, total)
+        new_credit = await credit_of(m.from_user.id)
+        msg = f"Received {amount}{E['star']}"
+        if bonus: msg += f" (+{bonus}{E['star']} bonus)"
+        msg += f". Internal credit: {new_credit}{E['star']}."
+        await m.answer(msg)
+
+# ───────── HEALTH / LOGS / TEST
+@router.callback_query(F.data == "health:run")
+async def health(c: CallbackQuery):
+    if await deny(c): return
+    ok_api = False
+    try:
+        gifts = await gifts_from_api()
+        ok_api = gifts is not None
+    except: pass
+    await c.message.edit_text(f"Health\n— API: {'ok '+E['ok'] if ok_api else 'fail '+E['bad']}\n— Loop: running {E['ok']}", reply_markup=back_home()); await c.answer()
+
+@router.callback_query(F.data == "logs:open")
+async def logs(c: CallbackQuery):
+    if await deny(c): return
+    async with open_db() as db:
+        async with db.execute("SELECT ts,level,msg FROM events ORDER BY id DESC LIMIT 10") as cur:
+            rows=await cur.fetchall()
+    lines=[f"{datetime.fromtimestamp(r['ts']).strftime('%H:%M:%S')} [{r['level']}] {r['msg']}" for r in rows]
+    await c.message.edit_text("Logs\n"+"\n".join(lines) if lines else "No logs.", reply_markup=back_home()); await c.answer()
+
+@router.callback_query(F.data == "test:menu")
+async def test_menu(c: CallbackQuery):
+    if await deny(c): return
+    await c.message.edit_text("Test Event\n— Simulate a limited drop.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Simulate drop (notify)", callback_data="test:drop")],
+        [InlineKeyboardButton(text="Back", callback_data="home")]
+    ])); await c.answer()
+
+@router.callback_query(F.data == "test:drop")
+async def test_drop(c: CallbackQuery):
+    if await deny(c): return
+    await c.message.answer("🚨 Limited gift detected (test) — will try to buy if Auto-Buy is ON.")
+    await c.answer()
+
+# ───────── AUTOBUY & NOTIFIER
+async def autobuy_loop(bot: Bot):
+    await asyncio.sleep(2)
+    while True:
+        try:
+            for uid in ADMIN_IDS:
+                await ensure_user(uid)
+                u = await guser(uid)
+                if not u.get("auto_on",0): continue
+                s = await settings_of(uid)
+                gifts = await gifts_from_api()
+                # only limited (remaining_count present and > 0)
+                gifts = [g for g in gifts if g.get("remaining") is not None and int(g.get("remaining") or 0) > 0]
+                lo, hi = s["min_price"], s["max_price"] or 10**9
+                gifts = [g for g in gifts if lo <= g["star_count"] <= hi]
+                if not gifts: continue
+                # prefer 💝 and cheaper
+                gifts.sort(key=lambda x: (x["emoji"] != E["heart"], x["star_count"]))
+                if s["overall_limit"] and (await spent_today(uid)) >= s["overall_limit"]:
+                    continue
+                for g in gifts:
+                    price=g["star_count"]
+                    if s["overall_limit"] and (await spent_today(uid)) + price > s["overall_limit"]:
+                        continue
+                    if await credit_of(uid) < price:
+                        continue
+                    try:
+                        await TGAPI.send_gift(uid, g["gift_id"], text="Auto")
+                    except Exception as e:
+                        await log("ERROR", f"AUTO send_gift: {e}")
+                        continue
+                    await add_credit(uid, -price)
+                    await add_spent(uid, price)
+                    async with open_db() as db:
+                        await db.execute("INSERT INTO purchases(user_id,gift_id,title,stars,auto,ts) VALUES (?,?,?,?,?,?)",
+                                         (uid,g["gift_id"],g["title"],price,1,int(datetime.now().timestamp())))
+                        await db.commit()
+                    await asyncio.sleep(0.05)
+        except Exception as e:
+            await log("ERROR", f"autobuy_loop: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(AUTO_LOOP_SEC)
+
+async def notifier_loop(bot: Bot):
+    await asyncio.sleep(2)
+    prev_ids=set()
+    while True:
+        try:
+            gifts = await gifts_from_api()
+            limited = [g for g in gifts if g.get("remaining") is not None and int(g.get("remaining") or 0) > 0]
+            curr_ids={g["gift_id"] for g in limited}
+            new = [g for g in limited if g["gift_id"] not in prev_ids]
+            if new:
+                for uid in ADMIN_IDS:
+                    if not (await guser(uid)).get("notify_on",1): continue
+                    lines=["🚨 Limited gifts:"]
+                    for g in new:
+                        lines.append(f"• {g['emoji']} {g['title']} — {g['star_count']}{E['star']}")
+                    try: await bot.send_message(uid, "\n".join(lines))
+                    except: pass
+            prev_ids=curr_ids
+        except Exception as e:
+            await log("ERROR", f"notifier_loop: {e}")
+        await asyncio.sleep(NOTIFY_LOOP_SEC)
+
+# ───────── RUN
+async def main():
+    bot = Bot(BOT_TOKEN)
+    dp  = Dispatcher()
+    dp.include_router(router)
+    asyncio.create_task(autobuy_loop(bot))
+    asyncio.create_task(notifier_loop(bot))
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
